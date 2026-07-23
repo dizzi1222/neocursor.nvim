@@ -16,6 +16,9 @@ local state = {
   suggestion = nil, -- { bufnr, start0, end0_excl, lines, mode }
   cfg = nil,
   ignore_next_move = false, -- guard: accept moves the cursor; don't re-request
+  viewed = {},    -- [bufnr] = ms of last BufEnter (recency for additionalFiles)
+  dbase = {},     -- [bufnr] = { path, text } baseline snapshot for diffing
+  dtraj = {},     -- [path]  = { {diff, ts}, ... } committed edit trajectory
 }
 
 local function plugin_root()
@@ -132,19 +135,179 @@ function M.start()
   state.job = job
 end
 
+-- Gather the proximity context Cursor's native Tab sends as `additionalFiles`:
+-- other visible splits (isOpen=true) plus the most-recently-visited buffers
+-- (isOpen=false), each reduced to a bounded on-screen/near-cursor slice.
+local function collect_additional_files(cur_buf)
+  local MAX_FILES, MAX_LINES = 8, 200
+  local files, seen = {}, {}
+
+  local function relpath(b)
+    local n = vim.api.nvim_buf_get_name(b)
+    if n == "" then return nil end
+    return vim.fn.fnamemodify(n, ":.")
+  end
+  local function usable(b)
+    return vim.api.nvim_buf_is_loaded(b)
+      and vim.bo[b].buftype == ""
+      and vim.api.nvim_buf_get_name(b) ~= ""
+  end
+  local function push(b, is_open, top, bot, ts)
+    local lines = vim.api.nvim_buf_get_lines(b, top - 1, bot, false)
+    if #lines == 0 then return end
+    seen[b] = true
+    files[#files + 1] = {
+      path = relpath(b), is_open = is_open, last_viewed_at = ts,
+      ranges = { { start = top, stop = top + #lines - 1, content = table.concat(lines, "\n") } },
+    }
+  end
+
+  -- 1) other visible splits → exactly what's on screen there
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    local b = vim.api.nvim_win_get_buf(win)
+    if b ~= cur_buf and not seen[b] and usable(b) then
+      push(b, true, math.max(1, vim.fn.line("w0", win)), vim.fn.line("w$", win), state.viewed[b])
+    end
+  end
+
+  -- 2) recently-visited buffers not on screen → a slice around their last cursor
+  local mru = {}
+  for b, t in pairs(state.viewed) do
+    if b ~= cur_buf and not seen[b] and usable(b) then mru[#mru + 1] = { b = b, t = t } end
+  end
+  table.sort(mru, function(x, y) return x.t > y.t end)
+  for _, e in ipairs(mru) do
+    if #files >= MAX_FILES then break end
+    local total = vim.api.nvim_buf_line_count(e.b)
+    local mark = vim.api.nvim_buf_get_mark(e.b, '"')
+    local center = (mark[1] > 0) and mark[1] or 1
+    local top = math.max(1, center - math.floor(MAX_LINES / 2))
+    push(e.b, false, top, math.min(total, top + MAX_LINES - 1), e.t)
+  end
+
+  return files
+end
+
+local function buf_relpath(b)
+  local n = vim.api.nvim_buf_get_name(b)
+  if n == "" then return nil end
+  return vim.fn.fnamemodify(n, ":.")
+end
+
+local function buf_text(b)
+  return table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
+end
+
+local function cap(s, n)
+  if #s > n then return s:sub(1, n) .. "\n… (truncated)" end
+  return s
+end
+
+-- linterErrors: current-buffer diagnostics → native LinterError shape (0-indexed).
+-- vim.diagnostic.severity (ERROR/WARN/INFO/HINT = 1/2/3/4) matches Cursor's enum 1:1.
+local SEV = {
+  [vim.diagnostic.severity.ERROR] = 1,
+  [vim.diagnostic.severity.WARN] = 2,
+  [vim.diagnostic.severity.INFO] = 3,
+  [vim.diagnostic.severity.HINT] = 4,
+}
+local function collect_linter_errors(buf, path)
+  if not path then return nil end
+  local diags = vim.diagnostic.get(buf)
+  if #diags == 0 then return nil end
+  local errors = {}
+  for _, d in ipairs(diags) do
+    if #errors >= 30 then break end
+    errors[#errors + 1] = {
+      message = d.message or "",
+      source = d.source,
+      severity = SEV[d.severity] or 1,
+      range = {
+        sl = d.lnum or 0, sc = d.col or 0,
+        el = d.end_lnum or d.lnum or 0, ec = d.end_col or d.col or 0,
+      },
+    }
+  end
+  return { path = path, errors = errors }
+end
+
+-- diff trajectory: baseline snapshot per buffer; unified diff baseline→current is
+-- the edit. commit_diff() coalesces at logical boundaries (InsertLeave/BufLeave).
+local MAX_TRAJ, DIFF_CAP = 6, 4000
+
+local function ensure_baseline(buf, path)
+  if path and not state.dbase[buf] then
+    state.dbase[buf] = { path = path, text = buf_text(buf) }
+  end
+end
+
+-- returns (diff_string, current_text) or nil if unchanged
+local function buf_diff(buf)
+  local b = state.dbase[buf]
+  if not b then return nil end
+  local cur = buf_text(buf)
+  if cur == b.text then return nil end
+  local d = vim.diff(b.text .. "\n", cur .. "\n", { result_type = "unified", ctxlen = 3 })
+  if type(d) ~= "string" or d == "" then return nil end
+  return cap(d, DIFF_CAP), cur
+end
+
+local function commit_diff(buf)
+  local path = buf_relpath(buf)
+  if not path then return end
+  local d, cur = buf_diff(buf)
+  if not d then return end
+  local traj = state.dtraj[path]
+  if not traj then traj = {}; state.dtraj[path] = traj end
+  traj[#traj + 1] = { diff = d, ts = os.time() * 1000 }
+  while #traj > MAX_TRAJ do table.remove(traj, 1) end
+  state.dbase[buf] = { path = path, text = cur } -- advance baseline past this edit
+end
+
+local function collect_file_diff_histories(cur_buf, cur_path)
+  local by_path = {}
+  for path, traj in pairs(state.dtraj) do
+    if #traj > 0 then
+      local diffs, ts = {}, {}
+      for _, e in ipairs(traj) do diffs[#diffs + 1] = e.diff; ts[#ts + 1] = e.ts end
+      by_path[path] = { file_name = path, diff_history = diffs, diff_history_timestamps = ts }
+    end
+  end
+  -- append the uncommitted in-progress edit of the current file as the newest step
+  local d = buf_diff(cur_buf)
+  if d and cur_path then
+    local rec = by_path[cur_path]
+    if not rec then
+      rec = { file_name = cur_path, diff_history = {}, diff_history_timestamps = {} }
+      by_path[cur_path] = rec
+    end
+    rec.diff_history[#rec.diff_history + 1] = d
+    rec.diff_history_timestamps[#rec.diff_history_timestamps + 1] = os.time() * 1000
+  end
+  local arr = {}
+  for _, rec in pairs(by_path) do arr[#arr + 1] = rec end
+  if #arr == 0 then return nil end
+  return arr
+end
+
 local function send_request()
   if not state.job then return end
   local bufnr = vim.api.nvim_get_current_buf()
   local cur = vim.api.nvim_win_get_cursor(0)
   state.seq = state.seq + 1
   local name = vim.fn.expand("%:.")
+  local path = name ~= "" and name or "untitled"
+  ensure_baseline(bufnr, buf_relpath(bufnr))
   local req = {
     id = state.seq,
-    path = name ~= "" and name or "untitled",
-    content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n"),
+    path = path,
+    content = buf_text(bufnr),
     line = cur[1] - 1,
     col = cur[2],
     language = vim.bo[bufnr].filetype ~= "" and vim.bo[bufnr].filetype or "plaintext",
+    additional_files = collect_additional_files(bufnr),
+    linter_errors = collect_linter_errors(bufnr, buf_relpath(bufnr)),
+    file_diff_histories = collect_file_diff_histories(bufnr, buf_relpath(bufnr)),
   }
   vim.fn.chansend(state.job, vim.json.encode(req) .. "\n")
 end
@@ -216,7 +379,20 @@ function M.setup(opts)
     end,
   })
   vim.api.nvim_create_autocmd({ "InsertLeave", "BufLeave" }, {
-    group = grp, callback = clear_suggestion,
+    group = grp,
+    callback = function(args)
+      commit_diff(args.buf) -- coalesce the just-finished edit into the trajectory
+      clear_suggestion()
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = grp,
+    callback = function(args)
+      if vim.bo[args.buf].buftype == "" and vim.api.nvim_buf_get_name(args.buf) ~= "" then
+        state.viewed[args.buf] = os.time() * 1000
+        ensure_baseline(args.buf, buf_relpath(args.buf))
+      end
+    end,
   })
 
   if state.cfg.map_tab then
@@ -231,6 +407,9 @@ function M.setup(opts)
 
   vim.api.nvim_create_user_command("TabtabDebug", function()
     local s = state.suggestion
+    local dbuf = vim.api.nvim_get_current_buf()
+    local dlint = collect_linter_errors(dbuf, buf_relpath(dbuf))
+    local dfdh = collect_file_diff_histories(dbuf, buf_relpath(dbuf))
     local lines = {
       "── tabtab debug ──",
       "sidecar job : " .. tostring(state.job) .. (state.ready and "  READY" or "  (no ready signal)"),
@@ -238,6 +417,9 @@ function M.setup(opts)
       "suggestion  : " .. (s and (s.mode .. "  lines=" .. #s.lines) or "none"),
       "buffer      : buftype='" .. vim.bo.buftype .. "'  filetype='" .. vim.bo.filetype .. "'",
       "attach ok   : " .. tostring(should_attach(vim.api.nvim_get_current_buf())),
+      "ctx files   : " .. tostring(#collect_additional_files(dbuf)),
+      "linter errs : " .. tostring(dlint and #dlint.errors or 0),
+      "diff files  : " .. tostring(dfdh and #dfdh or 0),
       "last error  : " .. tostring(state.last_error or "none"),
       "last stderr : " .. tostring(state.last_stderr or "none"),
     }

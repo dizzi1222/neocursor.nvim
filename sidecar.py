@@ -3,7 +3,10 @@
 tabtab.nvim sidecar — persistent stdio server speaking Cursor's StreamCpp.
 
 Protocol (one JSON object per line, both directions):
-  in : {"id":N,"path":str,"content":str,"line":int0,"col":int0,"language":str}
+  in : {"id":N,"path":str,"content":str,"line":int0,"col":int0,"language":str,
+        "additional_files"?:[{path,is_open,last_viewed_at?,ranges:[{start,stop,content}]}],
+        "linter_errors"?:{path,errors:[{message,source?,severity,range:{sl,sc,el,ec}}]},
+        "file_diff_histories"?:[{file_name,diff_history:[str],diff_history_timestamps:[ms]}]}
   out: {"id":N,"text":str,"range":{"start":int1,"endInclusive":int1}|null}
        {"id":N,"error":str}
 
@@ -106,6 +109,56 @@ HEADERS = {
 }
 
 
+def _addl(a: dict) -> dict:
+    # reshape a neutral nvim range-bundle into Cursor's AdditionalFile message
+    ranges = a.get("ranges") or []
+    out = {
+        "relativeWorkspacePath": a.get("path") or "untitled",
+        "isOpen": bool(a.get("is_open")),
+        "visibleRangeContent": [r.get("content", "") for r in ranges],
+        "startLineNumberOneIndexed": [r.get("start", 1) for r in ranges],
+        "visibleRanges": [
+            {
+                "startLineNumber": r.get("start", 1),
+                "endLineNumberInclusive": r.get("stop", r.get("start", 1)),
+            }
+            for r in ranges
+        ],
+    }
+    if a.get("last_viewed_at") is not None:
+        out["lastViewedAt"] = a["last_viewed_at"]
+    return out
+
+
+def _fdh(h: dict) -> dict:
+    # neutral nvim bundle -> Cursor CppFileDiffHistory
+    out = {
+        "fileName": h.get("file_name") or "untitled",
+        "diffHistory": h.get("diff_history") or [],
+    }
+    ts = h.get("diff_history_timestamps")
+    if ts:
+        out["diffHistoryTimestamps"] = ts
+    return out
+
+
+def _linter(l: dict) -> dict:
+    # neutral nvim bundle -> Cursor LinterErrors (positions are 0-indexed)
+    errors = []
+    for e in l.get("errors") or []:
+        item = {"message": e.get("message", ""), "severity": e.get("severity", 1)}
+        if e.get("source"):
+            item["source"] = e["source"]
+        r = e.get("range")
+        if r:
+            item["range"] = {
+                "startPosition": {"line": r.get("sl", 0), "column": r.get("sc", 0)},
+                "endPosition": {"line": r.get("el", 0), "column": r.get("ec", 0)},
+            }
+        errors.append(item)
+    return {"relativeWorkspacePath": l.get("path") or "untitled", "errors": errors}
+
+
 def complete(req: dict) -> dict:
     body = {
         "currentFile": {
@@ -117,6 +170,15 @@ def complete(req: dict) -> dict:
         "modelName": "",
         "diffHistory": [],
     }
+    adds = req.get("additional_files") or []
+    if adds:
+        body["additionalFiles"] = [_addl(a) for a in adds]
+    fdh = req.get("file_diff_histories") or []
+    if fdh:
+        body["fileDiffHistories"] = [_fdh(h) for h in fdh]
+    lint = req.get("linter_errors")
+    if lint and lint.get("errors"):
+        body["linterErrors"] = _linter(lint)
     h = dict(HEADERS)
     h["authorization"] = f"Bearer {TOK}"
     h["x-cursor-checksum"] = checksum(MID, MAC)

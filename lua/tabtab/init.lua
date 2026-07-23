@@ -22,6 +22,9 @@ local state = {
   dbase = {},     -- [bufnr] = { path, text } baseline snapshot for diffing
   dtraj = {},     -- [path]  = { {diff, ts}, ... } committed edit trajectory
   rejects = {},   -- [key]   = times the user dismissed this exact suggestion
+  log = {},       -- ring buffer of event strings for :TabtabLog
+  log_buf = nil,
+  log_dirty = false,
 }
 
 local function plugin_root()
@@ -37,6 +40,44 @@ local function clear_suggestion()
   state.queue = nil -- abandon any pending multi-edit chain
 end
 
+-- Persistent event log rendered by :TabtabLog. Every request, response, render,
+-- suppression, jump/accept, and sidecar event lands here, so the whole pipeline
+-- is visible at all times rather than in a notification that vanishes.
+local function log_refresh()
+  state.log_dirty = false
+  local buf = state.log_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local c = state.cfg or {}
+  local lines = {
+    ("── tabtab ─ debounce=%sms · heuristics=%d · excludes=%d · sidecar=%s ──"):format(
+      c.debounce or "?", c.heuristics and #c.heuristics or 0,
+      c.exclude_patterns and #c.exclude_patterns or 0,
+      state.ready and "ready" or (state.job and "starting" or "down")),
+    ("seq=%d  chain=%s  last_error=%s"):format(
+      state.seq, state.queue and (state.queue.idx .. "/" .. #state.queue.list) or "none",
+      tostring(state.last_error or "none")),
+    "",
+  }
+  for _, l in ipairs(state.log) do lines[#lines + 1] = l end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_get_buf(win) == buf then
+      pcall(vim.api.nvim_win_set_cursor, win, { #lines, 0 })
+    end
+  end
+end
+
+local function log(line)
+  state.log[#state.log + 1] = os.date("%H:%M:%S") .. "  " .. line
+  if #state.log > 500 then table.remove(state.log, 1) end
+  if not state.log_dirty then
+    state.log_dirty = true
+    vim.schedule(log_refresh)
+  end
+end
+
 -- Tunables the sidecar fetched from Cursor's CppConfig (debounce, context
 -- exclude-list, active heuristics, rejection threshold). Nil fields are left
 -- at their defaults so a failed fetch degrades gracefully.
@@ -45,6 +86,8 @@ local function apply_config(cfg)
   if type(cfg.exclude_patterns) == "table" then state.cfg.exclude_patterns = cfg.exclude_patterns end
   if type(cfg.heuristics) == "table" then state.cfg.heuristics = cfg.heuristics end
   if type(cfg.reject_hard) == "number" then state.cfg.reject_hard = cfg.reject_hard end
+  log(("CONFIG  debounce=%sms heuristics=%d excludes=%d"):format(
+    state.cfg.debounce, #state.cfg.heuristics, #state.cfg.exclude_patterns))
 end
 
 -- Is the cursor currently on the edit's target region? This is Cursor's
@@ -91,6 +134,7 @@ local function show_edit(edit)
     local at = cursor_at(start0, end0_excl)
     preview.diff(bufnr, start0, cur_range, lines, at and "<Tab> accept" or "<Tab> jump")
   end
+  log(("SHOW    %-6s L%d  (%d ln)"):format(mode, start0 + 1, #lines))
   return true
 end
 
@@ -141,7 +185,7 @@ local function render_result(res)
   local bufnr = vim.api.nvim_get_current_buf()
   local edits_in = res.edits
   if not edits_in or #edits_in == 0 then
-    if (res.text or "") == "" then return end
+    if (res.text or "") == "" then log("NOOP    empty response"); return end
     edits_in = { { text = res.text, range = res.range } } -- back-compat
   end
   local row1 = vim.api.nvim_win_get_cursor(0)[1]
@@ -168,6 +212,7 @@ local function render_result(res)
   if suppressed then
     state.last_suppressed = suppressed
     state.queue = nil
+    log("SUPPRESS " .. suppressed)
     return
   end
 
@@ -176,19 +221,34 @@ local function render_result(res)
     if show_edit(list[state.queue.idx]) then return end
     state.queue.idx = state.queue.idx + 1
   end
-  state.queue = nil -- everything was a no-op
+  state.queue = nil
+  log("NOOP    suggestion matches buffer")
+end
+
+local function result_summary(res)
+  local parts = {}
+  for _, e in ipairs(res.edits or {}) do
+    parts[#parts + 1] = e.range and ("L" .. e.range.start .. "-" .. e.range.endInclusive) or "L?"
+  end
+  local pred = res.prediction and ("  pred=" .. tostring(res.prediction.path) .. ":" .. tostring(res.prediction.line)) or ""
+  return ("edits=%d  [%s]%s"):format(#(res.edits or {}), table.concat(parts, ", "), pred)
 end
 
 local function handle_result(res)
   if res.error then
     state.last_error = res.error
+    log("ERR     #" .. tostring(res.id) .. "  " .. tostring(res.error))
     vim.schedule(function()
       vim.notify("tabtab: " .. tostring(res.error), vim.log.levels.WARN)
     end)
     return
   end
   state.last_ok_at = os.time()
-  if res.id ~= state.seq then return end -- superseded by a newer keystroke
+  if res.id ~= state.seq then
+    log(("RES     #%s  (stale, seq=%d)  %s"):format(tostring(res.id), state.seq, result_summary(res)))
+    return
+  end
+  log(("RES     #%s  %s"):format(tostring(res.id), result_summary(res)))
   vim.schedule(function()
     if vim.api.nvim_buf_is_valid(vim.api.nvim_get_current_buf()) then
       render_result(res)
@@ -197,7 +257,9 @@ local function handle_result(res)
 end
 
 local function handle_line(line)
-  local ok, res = pcall(vim.json.decode, line)
+  -- luanil so JSON null decodes to nil, not vim.NIL (which is a truthy userdata
+  -- and would crash `res.prediction`/`e.range` guards).
+  local ok, res = pcall(vim.json.decode, line, { luanil = { object = true, array = true } })
   if not (ok and type(res) == "table") then return end
   if res.config then apply_config(res.config) else handle_result(res) end
 end
@@ -215,7 +277,7 @@ local function on_stderr(_, data)
   if not data then return end
   for _, l in ipairs(data) do
     if l ~= "" then
-      if l:find("ready") then state.ready = true else state.last_stderr = l end
+      if l:find("ready") then state.ready = true; log("SIDECAR ready") else state.last_stderr = l; log("SIDECAR " .. l) end
     end
   end
 end
@@ -227,13 +289,15 @@ function M.start()
   local job = vim.fn.jobstart(cmd, {
     on_stdout = on_stdout,
     on_stderr = on_stderr,
-    on_exit = function() state.job = nil; state.ready = false end,
+    on_exit = function() state.job = nil; state.ready = false; log("SIDECAR exited") end,
   })
   if job <= 0 then
     vim.notify("tabtab: failed to launch sidecar", vim.log.levels.ERROR)
+    log("SIDECAR launch failed")
     return
   end
   state.job = job
+  log("SIDECAR launching")
 end
 
 -- Gather the proximity context Cursor's native Tab sends as `additionalFiles`:
@@ -407,6 +471,10 @@ local function send_request()
   local name = vim.fn.expand("%:.")
   local path = name ~= "" and name or "untitled"
   ensure_baseline(bufnr, buf_relpath(bufnr))
+  local rp = buf_relpath(bufnr)
+  local adds = collect_additional_files(bufnr)
+  local lint = collect_linter_errors(bufnr, rp)
+  local fdh = collect_file_diff_histories(bufnr, rp)
   local req = {
     id = state.seq,
     path = path,
@@ -414,11 +482,13 @@ local function send_request()
     line = cur[1] - 1,
     col = cur[2],
     language = vim.bo[bufnr].filetype ~= "" and vim.bo[bufnr].filetype or "plaintext",
-    additional_files = collect_additional_files(bufnr),
-    linter_errors = collect_linter_errors(bufnr, buf_relpath(bufnr)),
-    file_diff_histories = collect_file_diff_histories(bufnr, buf_relpath(bufnr)),
+    additional_files = adds,
+    linter_errors = lint,
+    file_diff_histories = fdh,
   }
   vim.fn.chansend(state.job, vim.json.encode(req) .. "\n")
+  log(("REQ     #%d  %s %d:%d  ctx=%d diffs=%d lint=%d"):format(
+    state.seq, path, cur[1] - 1, cur[2], #adds, fdh and #fdh or 0, lint and #lint.errors or 0))
 end
 
 local function should_attach(bufnr)
@@ -481,8 +551,10 @@ function M.accept()
   local s = state.suggestion
   if not s then return false end
   if cursor_at(s.start0, s.end0_excl) then
+    log("ACCEPT  L" .. (s.start0 + 1))
     accept_current(s)
   else
+    log("JUMP    L" .. (s.start0 + 1))
     jump_to(s)
   end
   return true
@@ -493,8 +565,30 @@ function M.dismiss()
   if s then
     local key = reject_key(vim.fn.expand("%:."), s)
     state.rejects[key] = (state.rejects[key] or 0) + 1
+    log(("DISMISS L%d  (rejected ×%d)"):format(s.start0 + 1, state.rejects[key]))
   end
   clear_suggestion()
+end
+
+function M.log()
+  if not (state.log_buf and vim.api.nvim_buf_is_valid(state.log_buf)) then
+    state.log_buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[state.log_buf].bufhidden = "hide"
+    vim.bo[state.log_buf].filetype = "tabtablog"
+    pcall(vim.api.nvim_buf_set_name, state.log_buf, "tabtab://log")
+  end
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_get_buf(win) == state.log_buf then
+      vim.api.nvim_win_close(win, true) -- toggle off if already open
+      return
+    end
+  end
+  vim.cmd("botright 14split")
+  local win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(win, state.log_buf)
+  vim.wo[win].number, vim.wo[win].relativenumber, vim.wo[win].wrap = false, false, false
+  log_refresh()
+  vim.cmd("wincmd p") -- keep focus where the user was typing
 end
 function M.has_suggestion() return state.suggestion ~= nil end
 function M.suggest() send_request() end -- manual trigger (:TabtabSuggest)
@@ -546,6 +640,7 @@ function M.setup(opts)
 
   vim.keymap.set("i", "<C-]>", M.dismiss, { desc = "tabtab: dismiss" })
   vim.api.nvim_create_user_command("TabtabSuggest", M.suggest, { desc = "request a suggestion now" })
+  vim.api.nvim_create_user_command("TabtabLog", M.log, { desc = "toggle the tabtab live log pane" })
 
   vim.api.nvim_create_user_command("TabtabDebug", function()
     local s = state.suggestion

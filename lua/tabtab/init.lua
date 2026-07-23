@@ -5,6 +5,7 @@
 local M = {}
 
 local preview = require("tabtab.preview")
+local heuristics = require("tabtab.heuristics")
 local uv = vim.uv or vim.loop
 
 local state = {
@@ -20,6 +21,7 @@ local state = {
   viewed = {},    -- [bufnr] = ms of last BufEnter (recency for additionalFiles)
   dbase = {},     -- [bufnr] = { path, text } baseline snapshot for diffing
   dtraj = {},     -- [path]  = { {diff, ts}, ... } committed edit trajectory
+  rejects = {},   -- [key]   = times the user dismissed this exact suggestion
 }
 
 local function plugin_root()
@@ -33,6 +35,16 @@ local function clear_suggestion()
     state.suggestion = nil
   end
   state.queue = nil -- abandon any pending multi-edit chain
+end
+
+-- Tunables the sidecar fetched from Cursor's CppConfig (debounce, context
+-- exclude-list, active heuristics, rejection threshold). Nil fields are left
+-- at their defaults so a failed fetch degrades gracefully.
+local function apply_config(cfg)
+  if type(cfg.debounce) == "number" and cfg.debounce > 0 then state.cfg.debounce = cfg.debounce end
+  if type(cfg.exclude_patterns) == "table" then state.cfg.exclude_patterns = cfg.exclude_patterns end
+  if type(cfg.heuristics) == "table" then state.cfg.heuristics = cfg.heuristics end
+  if type(cfg.reject_hard) == "number" then state.cfg.reject_hard = cfg.reject_hard end
 end
 
 -- Is the cursor currently on the edit's target region? This is Cursor's
@@ -108,6 +120,22 @@ local function advance_after_apply(applied)
   state.queue = nil -- chain exhausted
 end
 
+local function reject_key(path, edit)
+  return path .. "@" .. edit.start0 .. ":" .. table.concat(edit.lines, "\n")
+end
+
+-- Lines the user just deleted (the newest diff's "-" lines), for the
+-- reverting-user-change heuristic.
+local function recently_removed(path)
+  local traj = state.dtraj[path]
+  if not traj or #traj == 0 then return nil end
+  local set = {}
+  for line in traj[#traj].diff:gmatch("[^\n]+") do
+    if line:sub(1, 1) == "-" and line:sub(1, 3) ~= "---" then set[line:sub(2)] = true end
+  end
+  return set
+end
+
 -- Build the edit queue from a sidecar result and show the first showable edit.
 local function render_result(res)
   local bufnr = vim.api.nvim_get_current_buf()
@@ -128,6 +156,19 @@ local function render_result(res)
       end0_excl = end1,
       lines = vim.split(e.text or "", "\n", { plain = true }),
     }
+  end
+
+  local path = vim.fn.expand("%:.")
+  local first = list[1]
+  local suppressed = heuristics.should_suppress(state.cfg.heuristics, {
+    bufnr = bufnr, start0 = first.start0, end0_excl = first.end0_excl, lines = first.lines,
+    recently_removed = recently_removed(path),
+    rejections = state.rejects, key = reject_key(path, first), hard_reject = state.cfg.reject_hard,
+  })
+  if suppressed then
+    state.last_suppressed = suppressed
+    state.queue = nil
+    return
   end
 
   state.queue = { list = list, idx = 1 }
@@ -157,7 +198,8 @@ end
 
 local function handle_line(line)
   local ok, res = pcall(vim.json.decode, line)
-  if ok and type(res) == "table" then handle_result(res) end
+  if not (ok and type(res) == "table") then return end
+  if res.config then apply_config(res.config) else handle_result(res) end
 end
 
 local function on_stdout(_, data)
@@ -211,12 +253,20 @@ local function collect_additional_files(cur_buf)
       and vim.bo[b].buftype == ""
       and vim.api.nvim_buf_get_name(b) ~= ""
   end
+  local function excluded(path)
+    for _, pat in ipairs(state.cfg.exclude_patterns or {}) do
+      if path:find(pat, 1, true) then return true end
+    end
+    return false
+  end
   local function push(b, is_open, top, bot, ts)
+    local path = relpath(b)
+    if not path or excluded(path) then return end
     local lines = vim.api.nvim_buf_get_lines(b, top - 1, bot, false)
     if #lines == 0 then return end
     seen[b] = true
     files[#files + 1] = {
-      path = relpath(b), is_open = is_open, last_viewed_at = ts,
+      path = path, is_open = is_open, last_viewed_at = ts,
       ranges = { { start = top, stop = top + #lines - 1, content = table.concat(lines, "\n") } },
     }
   end
@@ -438,7 +488,14 @@ function M.accept()
   return true
 end
 
-function M.dismiss() clear_suggestion() end
+function M.dismiss()
+  local s = state.suggestion
+  if s then
+    local key = reject_key(vim.fn.expand("%:."), s)
+    state.rejects[key] = (state.rejects[key] or 0) + 1
+  end
+  clear_suggestion()
+end
 function M.has_suggestion() return state.suggestion ~= nil end
 function M.suggest() send_request() end -- manual trigger (:TabtabSuggest)
 
@@ -449,6 +506,9 @@ function M.setup(opts)
     sidecar_cmd = opts.sidecar_cmd or { "uv", "run", "--with", "httpx[http2]" },
     map_tab = opts.map_tab ~= false, -- set false when another plugin (cmp) owns <Tab>
     filetypes = opts.filetypes,      -- optional allow-list; nil = all normal buffers
+    exclude_patterns = {},           -- filled from CppConfig (skip .env/.pem/... as context)
+    heuristics = {},                 -- filled from CppConfig (active suppression rules)
+    reject_hard = 2,
   }
   M.start()
 
@@ -498,6 +558,9 @@ function M.setup(opts)
       "requests    : seq=" .. tostring(state.seq) .. "  last_ok=" .. tostring(state.last_ok_at or "never"),
       "suggestion  : " .. (s and (s.mode .. "  lines=" .. #s.lines) or "none"),
       "chain       : " .. (state.queue and (state.queue.idx .. "/" .. #state.queue.list) or "none"),
+      "config      : debounce=" .. state.cfg.debounce .. "ms  heuristics=" .. #state.cfg.heuristics
+        .. "  excludes=" .. #state.cfg.exclude_patterns,
+      "last suppress: " .. tostring(state.last_suppressed or "none"),
       "buffer      : buftype='" .. vim.bo.buftype .. "'  filetype='" .. vim.bo.filetype .. "'",
       "attach ok   : " .. tostring(should_attach(vim.api.nvim_get_current_buf())),
       "ctx files   : " .. tostring(#collect_additional_files(dbuf)),

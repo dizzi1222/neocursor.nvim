@@ -109,6 +109,20 @@ HEADERS = {
     "connect-protocol-version": "1",
     "content-type": "application/connect+json",
 }
+STREAM_URL = URL
+
+
+def fetch_config() -> dict:
+    url = URL.rsplit("/", 1)[0] + "/CppConfig"
+    h = dict(HEADERS)
+    h["authorization"] = f"Bearer {TOK}"
+    h["x-cursor-checksum"] = checksum(MID, MAC)
+    h["content-type"] = "application/json"  # CppConfig is unary, not connect+json
+    try:
+        r = CLIENT.post(url, content=json.dumps({"model": "", "supportsCpt": True}).encode(), headers=h, timeout=10)
+        return r.json() if r.status_code == 200 else {}
+    except Exception:
+        return {}
 
 
 def _addl(a: dict) -> dict:
@@ -186,7 +200,7 @@ def complete(req: dict) -> dict:
     h = dict(HEADERS)
     h["authorization"] = f"Bearer {TOK}"
     h["x-cursor-checksum"] = checksum(MID, MAC)
-    r = CLIENT.post(URL, content=frame(json.dumps(body).encode()), headers=h)
+    r = CLIENT.post(STREAM_URL, content=frame(json.dumps(body).encode()), headers=h)
 
     # The multidiff model streams a SEQUENCE of edits in one response, each
     # bracketed by beginEdit/doneEdit, plus a cursorPredictionTarget pointing at
@@ -253,8 +267,19 @@ def complete(req: dict) -> dict:
 
 
 def main():
+    global STREAM_URL
+    cfg = fetch_config()
+    if cfg.get("cppUrl"):
+        STREAM_URL = cfg["cppUrl"].rstrip("/") + "/aiserver.v1.AiService/StreamCpp"
     sys.stderr.write("tabtab sidecar ready\n")
     sys.stderr.flush()
+    sys.stdout.write(json.dumps({"config": {
+        "debounce": cfg.get("clientDebounceDurationMillis"),
+        "exclude_patterns": cfg.get("excludeRecentlyViewedFilesPatterns") or [],
+        "heuristics": cfg.get("heuristics") or [],
+        "reject_hard": (cfg.get("recentlyRejectedEditThresholds") or {}).get("hardRejectThreshold"),
+    }}) + "\n")
+    sys.stdout.flush()
     for line in sys.stdin:
         line = line.strip()
         if not line:

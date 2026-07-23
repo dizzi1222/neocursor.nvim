@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""
+tabtab.nvim sidecar — persistent stdio server speaking Cursor's StreamCpp.
+
+Protocol (one JSON object per line, both directions):
+  in : {"id":N,"path":str,"content":str,"line":int0,"col":int0,"language":str}
+  out: {"id":N,"text":str,"range":{"start":int1,"endInclusive":int1}|null}
+       {"id":N,"error":str}
+
+line/col in the request are 0-indexed (neovim). range in the reply is
+1-indexed inclusive (as Cursor's backend returns it).
+
+Launch:  uv run --with 'httpx[http2]' sidecar.py
+"""
+import os, sys, json, base64, time, sqlite3, struct, socket, subprocess
+import httpx
+
+# --- resolver resilience -----------------------------------------------------
+# macOS mDNSResponder occasionally negative-caches a CNAME hop (Cursor's hosts
+# chain api2 -> api2geo -> api2direct), so getaddrinfo fails while `dig` still
+# resolves. Fall back to dig and connect by IP; httpx keeps the hostname for
+# SNI/cert verification, so TLS stays valid.
+_ORIG_GAI = socket.getaddrinfo
+
+
+def _dig_ipv4(host: str):
+    for cmd in (["dig", "+short", host, "A"], ["host", "-t", "A", host]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+        except Exception:
+            continue
+        for ln in out.splitlines():
+            tok = ln.strip().rstrip(".").split()[-1:] or [""]
+            ip = tok[0]
+            parts = ip.split(".")
+            if len(parts) == 4 and all(p.isdigit() for p in parts):
+                return ip
+    return None
+
+
+def _getaddrinfo(host, port, *a, **kw):
+    try:
+        return _ORIG_GAI(host, port, *a, **kw)
+    except socket.gaierror:
+        ip = _dig_ipv4(host)
+        if not ip:
+            raise
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, int(port or 0)))]
+
+
+socket.getaddrinfo = _getaddrinfo
+# -----------------------------------------------------------------------------
+
+SUP = os.path.expanduser("~/Library/Application Support/Cursor")
+GS  = f"{SUP}/User/globalStorage"
+URL = "https://api2.cursor.sh/aiserver.v1.AiService/StreamCpp"
+
+
+def read_token() -> str:
+    con = sqlite3.connect(f"file:{GS}/state.vscdb?mode=ro", uri=True)
+    row = con.execute(
+        "SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken'"
+    ).fetchone()
+    con.close()
+    if not row:
+        raise RuntimeError("no cursorAuth/accessToken — is Cursor signed in?")
+    return row[0]
+
+
+def alf(b: bytes) -> bytes:
+    o, t = bytearray(b), 0xA5
+    for i in range(len(o)):
+        o[i] = ((o[i] ^ t) + (i % 256)) & 0xFF
+        t = o[i]
+    return bytes(o)
+
+
+def checksum(mid: str, mac: str) -> str:
+    ts = int(time.time() * 1000) // 1_000_000
+    return base64.b64encode(alf(ts.to_bytes(6, "big"))).decode() + f"{mid}/{mac}"
+
+
+def frame(b: bytes) -> bytes:
+    return b"\x00" + struct.pack(">I", len(b)) + b
+
+
+def deframe(buf: bytes):
+    i = 0
+    while i + 5 <= len(buf):
+        flag = buf[i]
+        ln = struct.unpack(">I", buf[i + 1 : i + 5])[0]
+        i += 5
+        yield flag, buf[i : i + ln]
+        i += ln
+
+
+TOK = read_token()
+_sj = json.load(open(f"{GS}/storage.json"))
+MID, MAC = _sj["telemetry.machineId"], _sj["telemetry.macMachineId"]
+CLIENT = httpx.Client(http2=True, timeout=30)
+HEADERS = {
+    "x-cursor-client-version": "1.1.3",
+    "x-cursor-client-type": "ide",
+    "connect-protocol-version": "1",
+    "content-type": "application/connect+json",
+}
+
+
+def complete(req: dict) -> dict:
+    body = {
+        "currentFile": {
+            "relativeWorkspacePath": req.get("path") or "untitled",
+            "contents": req["content"],
+            "cursorPosition": {"line": req["line"], "column": req["col"]},
+            "languageId": req.get("language") or "plaintext",
+        },
+        "modelName": "",
+        "diffHistory": [],
+    }
+    h = dict(HEADERS)
+    h["authorization"] = f"Bearer {TOK}"
+    h["x-cursor-checksum"] = checksum(MID, MAC)
+    r = CLIENT.post(URL, content=frame(json.dumps(body).encode()), headers=h)
+    text, rng = "", None
+    for flag, msg in deframe(r.content):
+        if flag & 0x02:
+            continue
+        try:
+            j = json.loads(msg)
+        except Exception:
+            continue
+        text += j.get("text", "")
+        rr = j.get("rangeToReplace")
+        if rr:
+            rng = {
+                "start": rr.get("startLineNumber"),
+                "endInclusive": rr.get("endLineNumberInclusive"),
+            }
+    return {"text": text, "range": rng}
+
+
+def main():
+    sys.stderr.write("tabtab sidecar ready\n")
+    sys.stderr.flush()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        rid = None
+        try:
+            req = json.loads(line)
+            rid = req.get("id")
+            res = complete(req)
+            res["id"] = rid
+        except Exception as e:
+            res = {"id": rid, "error": str(e)}
+        sys.stdout.write(json.dumps(res) + "\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

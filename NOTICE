@@ -1,0 +1,19 @@
+tabtab.nvim
+===========
+
+The inline ghost-text rendering in lua/tabtab/preview.lua adapts a technique
+from two MIT-licensed neovim plugins. Thanks to their authors.
+
+  supermaven-nvim   https://github.com/supermaven-inc/supermaven-nvim
+                    lua/supermaven-nvim/completion_preview.lua
+
+  copilot.lua       https://github.com/zbirenbaum/copilot.lua
+                    lua/copilot/suggestion/init.lua
+
+The specific ideas reused:
+  * one extmark: first line as `virt_text`, remaining lines as `virt_lines`
+  * `virt_text_pos = "inline"` with an "eol" fallback for control characters
+  * an undo breakpoint before applying, and a cursor-move guard after accept
+
+No source files were copied verbatim; the renderer was reimplemented against
+tabtab's own data flow (range-replacements streamed from Cursor's backend).

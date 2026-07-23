@@ -7,7 +7,9 @@ Protocol (one JSON object per line, both directions):
         "additional_files"?:[{path,is_open,last_viewed_at?,ranges:[{start,stop,content}]}],
         "linter_errors"?:{path,errors:[{message,source?,severity,range:{sl,sc,el,ec}}]},
         "file_diff_histories"?:[{file_name,diff_history:[str],diff_history_timestamps:[ms]}]}
-  out: {"id":N,"text":str,"range":{"start":int1,"endInclusive":int1}|null}
+  out: {"id":N,"text":str,"range":{...}|null,
+        "edits":[{"text":str,"range":{"start":int1,"endInclusive":int1}|null}],
+        "prediction":{"path":str,"line":int1}|null}   # text/range == edits[0]
        {"id":N,"error":str}
 
 line/col in the request are 0-indexed (neovim). range in the reply is
@@ -169,6 +171,8 @@ def complete(req: dict) -> dict:
         },
         "modelName": "",
         "diffHistory": [],
+        "supportsCpt": True,       # opt into Cursor Prediction Target (tab-tab chain)
+        "supportsCrlfCpt": True,
     }
     adds = req.get("additional_files") or []
     if adds:
@@ -183,7 +187,25 @@ def complete(req: dict) -> dict:
     h["authorization"] = f"Bearer {TOK}"
     h["x-cursor-checksum"] = checksum(MID, MAC)
     r = CLIENT.post(URL, content=frame(json.dumps(body).encode()), headers=h)
-    text, rng = "", None
+
+    # The multidiff model streams a SEQUENCE of edits in one response, each
+    # bracketed by beginEdit/doneEdit, plus a cursorPredictionTarget pointing at
+    # the chain's first jump. Split them into an ordered list so the client can
+    # walk the chain locally (one Tab per edit) with no extra round-trips.
+    edits, cur, prediction = [], None, None
+
+    def flush():
+        nonlocal cur
+        if cur is not None and (cur["text"] or cur["range"] is not None):
+            t = cur["text"]
+            if cur["eol"]:  # shouldRemoveLeadingEol: drop the leading newline
+                if t.startswith("\r\n"):
+                    t = t[2:]
+                elif t.startswith("\n"):
+                    t = t[1:]
+            edits.append({"text": t, "range": cur["range"]})
+        cur = None
+
     for flag, msg in deframe(r.content):
         if flag & 0x02:
             continue
@@ -191,14 +213,43 @@ def complete(req: dict) -> dict:
             j = json.loads(msg)
         except Exception:
             continue
-        text += j.get("text", "")
+        if j.get("beginEdit"):
+            flush()
+            cur = {"text": "", "range": None, "eol": False}
+            continue
+        if "text" in j:
+            if cur is None:
+                cur = {"text": "", "range": None, "eol": False}
+            cur["text"] += j.get("text", "")
+            continue
         rr = j.get("rangeToReplace")
         if rr:
-            rng = {
+            if cur is None:
+                cur = {"text": "", "range": None, "eol": False}
+            cur["range"] = {
                 "start": rr.get("startLineNumber"),
                 "endInclusive": rr.get("endLineNumberInclusive"),
             }
-    return {"text": text, "range": rng}
+            if j.get("shouldRemoveLeadingEol"):
+                cur["eol"] = True
+            continue
+        cpt = j.get("cursorPredictionTarget")
+        if cpt and prediction is None:
+            prediction = {
+                "path": cpt.get("relativePath"),
+                "line": cpt.get("lineNumberOneIndexed"),
+            }
+        if j.get("doneEdit"):
+            flush()
+    flush()  # in case the stream ends mid-edit
+
+    first = edits[0] if edits else {"text": "", "range": None}
+    return {
+        "text": first["text"],
+        "range": first["range"],
+        "edits": edits,
+        "prediction": prediction,
+    }
 
 
 def main():

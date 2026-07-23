@@ -15,7 +15,8 @@ local state = {
   timer = nil,
   suggestion = nil, -- { bufnr, start0, end0_excl, lines, mode }
   cfg = nil,
-  ignore_next_move = false, -- guard: accept moves the cursor; don't re-request
+  walking = false, -- true while applying a chain locally; suppresses auto-requests
+  queue = nil,     -- { list = {edit,...}, idx } multi-edit chain from one response
   viewed = {},    -- [bufnr] = ms of last BufEnter (recency for additionalFiles)
   dbase = {},     -- [bufnr] = { path, text } baseline snapshot for diffing
   dtraj = {},     -- [path]  = { {diff, ts}, ... } committed edit trajectory
@@ -31,30 +32,30 @@ local function clear_suggestion()
     preview.clear(state.suggestion.bufnr)
     state.suggestion = nil
   end
+  state.queue = nil -- abandon any pending multi-edit chain
 end
 
--- Decide how to show a range-replacement. If the suggested text simply extends
--- what the user has already typed (its prefix equals the buffer content from
--- the range start up to the cursor) and nothing meaningful follows the cursor,
--- we can render it as inline ghost text. Otherwise fall back to a block preview.
-local function render_result(res)
-  local text = res.text or ""
-  if text == "" then return end
+-- Is the cursor currently on the edit's target region? This is Cursor's
+-- `cursorAtInlineEdit`: when false, <Tab> jumps here; when true, <Tab> accepts.
+local function cursor_at(start0, end0_excl)
+  local row0 = vim.api.nvim_win_get_cursor(0)[1] - 1
+  if end0_excl <= start0 then return row0 == start0 end
+  return row0 >= start0 and row0 < end0_excl
+end
 
-  local bufnr = vim.api.nvim_get_current_buf()
+-- Render one edit. If its text simply extends what the user has already typed
+-- (prefix equals buffer content from the range start up to the cursor, nothing
+-- meaningful after), show it as inline ghost text; otherwise a block diff.
+-- Returns false if the edit is a no-op (identical to what's already there).
+local function show_edit(edit)
+  local bufnr = edit.bufnr
+  local start0, end0_excl, lines = edit.start0, edit.end0_excl, edit.lines
   local cur = vim.api.nvim_win_get_cursor(0) -- { row1, col0 }
   local row1, col0 = cur[1], cur[2]
+  local text = table.concat(lines, "\n")
 
-  local start1 = (res.range and res.range.start) or row1
-  local end1 = (res.range and res.range.endInclusive) or row1
-  local start0 = math.max(0, start1 - 1)
-  local end0_excl = end1
-
-  local lines = vim.split(text, "\n", { plain = true })
-
-  -- no-op guard: suggestion identical to what's already there
   local cur_range = vim.api.nvim_buf_get_lines(bufnr, start0, end0_excl, false)
-  if table.concat(cur_range, "\n") == text then return end
+  if table.concat(cur_range, "\n") == text then return false end -- no-op
 
   local mode, ghost = "diff", nil
   if start0 <= row1 - 1 then
@@ -75,8 +76,66 @@ local function render_result(res)
   if mode == "inline" then
     preview.inline(bufnr, row1 - 1, col0, ghost)
   else
-    preview.diff(bufnr, start0, cur_range, lines)
+    local at = cursor_at(start0, end0_excl)
+    preview.diff(bufnr, start0, cur_range, lines, at and "<Tab> accept" or "<Tab> jump")
   end
+  return true
+end
+
+-- After applying the current edit, walk to the next one in the chain — locally,
+-- no network. Adjust the line numbers of edits below by the applied line delta,
+-- jump the cursor there, and render it. This is the "tab, tab, tab" loop.
+local function advance_after_apply(applied)
+  local q = state.queue
+  if not q then return end
+  local delta = #applied.lines - (applied.end0_excl - applied.start0)
+  q.idx = q.idx + 1
+  if delta ~= 0 then
+    for k = q.idx, #q.list do
+      local e = q.list[k]
+      if e.start0 >= applied.end0_excl then
+        e.start0 = e.start0 + delta
+        e.end0_excl = e.end0_excl + delta
+      end
+    end
+  end
+  -- Show the next edit in place; the cursor stays put, so the next <Tab> JUMPS
+  -- to it (Cursor's cursorAtInlineEdit rule), and the <Tab> after that accepts.
+  while q.idx <= #q.list do
+    if show_edit(q.list[q.idx]) then return end
+    q.idx = q.idx + 1 -- skip no-op edits
+  end
+  state.queue = nil -- chain exhausted
+end
+
+-- Build the edit queue from a sidecar result and show the first showable edit.
+local function render_result(res)
+  local bufnr = vim.api.nvim_get_current_buf()
+  local edits_in = res.edits
+  if not edits_in or #edits_in == 0 then
+    if (res.text or "") == "" then return end
+    edits_in = { { text = res.text, range = res.range } } -- back-compat
+  end
+  local row1 = vim.api.nvim_win_get_cursor(0)[1]
+  local list = {}
+  for _, e in ipairs(edits_in) do
+    local r = e.range
+    local start1 = (r and r.start) or row1
+    local end1 = (r and r.endInclusive) or row1
+    list[#list + 1] = {
+      bufnr = bufnr,
+      start0 = math.max(0, start1 - 1),
+      end0_excl = end1,
+      lines = vim.split(e.text or "", "\n", { plain = true }),
+    }
+  end
+
+  state.queue = { list = list, idx = 1 }
+  while state.queue.idx <= #list do
+    if show_edit(list[state.queue.idx]) then return end
+    state.queue.idx = state.queue.idx + 1
+  end
+  state.queue = nil -- everything was a no-op
 end
 
 local function handle_result(res)
@@ -334,22 +393,48 @@ local function schedule_request()
   end))
 end
 
+-- Apply the current edit, then reveal the next one (cursor stays put — the user
+-- <Tab>s to jump to it). Buffer edits are illegal under textlock (E565) so defer
+-- to the next tick. state.walking gates our own churn from triggering requests.
+local function accept_current(s)
+  local q = state.queue
+  preview.clear(s.bufnr)
+  state.suggestion = nil
+  vim.schedule(function()
+    if not vim.api.nvim_buf_is_valid(s.bufnr) then return end
+    state.walking = true
+    vim.cmd("let &undolevels=&undolevels") -- one undo reverts the whole accept
+    vim.api.nvim_buf_set_lines(s.bufnr, s.start0, s.end0_excl, false, s.lines)
+    pcall(vim.api.nvim_win_set_cursor, 0, { s.start0 + #s.lines, #(s.lines[#s.lines] or "") })
+    state.queue = q
+    advance_after_apply(s) -- local; no network
+    state.walking = false
+  end)
+end
+
+-- Move the cursor onto the edit (local, instant). This flips cursorAtInlineEdit
+-- true, so the NEXT <Tab> accepts. Preview stays; its hint refreshes to "accept".
+local function jump_to(s)
+  vim.schedule(function()
+    if not vim.api.nvim_buf_is_valid(s.bufnr) then return end
+    state.walking = true
+    local lc = vim.api.nvim_buf_line_count(s.bufnr)
+    pcall(vim.api.nvim_win_set_cursor, 0, { math.min(s.start0 + 1, lc), 0 })
+    show_edit(s)
+    state.walking = false
+  end)
+end
+
+-- <Tab> handler: jump-first, accept-second — Cursor's two-phase feel. Returns
+-- true synchronously so the caller (blink / expr map) knows Tab was consumed.
 function M.accept()
   local s = state.suggestion
   if not s then return false end
-  clear_suggestion() -- remove the ghost now (extmark op, allowed under textlock)
-  state.ignore_next_move = true
-  -- Buffer edits are NOT allowed inside a keymap/expr callback (textlock → E565),
-  -- so apply on the next tick. We still return true synchronously so the caller
-  -- (blink / expr map) knows the key was consumed.
-  vim.schedule(function()
-    if not vim.api.nvim_buf_is_valid(s.bufnr) then return end
-    vim.cmd("let &undolevels=&undolevels") -- one undo reverts the whole accept
-    vim.api.nvim_buf_set_lines(s.bufnr, s.start0, s.end0_excl, false, s.lines)
-    local last_row = s.start0 + #s.lines
-    local last_col = #(s.lines[#s.lines] or "")
-    pcall(vim.api.nvim_win_set_cursor, 0, { last_row, last_col })
-  end)
+  if cursor_at(s.start0, s.end0_excl) then
+    accept_current(s)
+  else
+    jump_to(s)
+  end
   return true
 end
 
@@ -371,10 +456,7 @@ function M.setup(opts)
   vim.api.nvim_create_autocmd({ "TextChangedI", "CursorMovedI" }, {
     group = grp,
     callback = function()
-      if state.ignore_next_move then
-        state.ignore_next_move = false
-        return
-      end
+      if state.walking then return end -- our own edits/jumps while walking a chain
       schedule_request()
     end,
   })
@@ -415,6 +497,7 @@ function M.setup(opts)
       "sidecar job : " .. tostring(state.job) .. (state.ready and "  READY" or "  (no ready signal)"),
       "requests    : seq=" .. tostring(state.seq) .. "  last_ok=" .. tostring(state.last_ok_at or "never"),
       "suggestion  : " .. (s and (s.mode .. "  lines=" .. #s.lines) or "none"),
+      "chain       : " .. (state.queue and (state.queue.idx .. "/" .. #state.queue.list) or "none"),
       "buffer      : buftype='" .. vim.bo.buftype .. "'  filetype='" .. vim.bo.filetype .. "'",
       "attach ok   : " .. tostring(should_attach(vim.api.nvim_get_current_buf())),
       "ctx files   : " .. tostring(#collect_additional_files(dbuf)),

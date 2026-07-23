@@ -63,7 +63,7 @@ end
 
 --- Diff overlay for edits that replace existing lines (overrides / rewrites).
 --- old_lines = current content of [start0, start0+#old_lines); new_lines = suggestion.
-function M.diff(bufnr, start0, old_lines, new_lines)
+function M.diff(bufnr, start0, old_lines, new_lines, hint)
   M.clear(bufnr)
   local hunks = vim.diff(
     table.concat(old_lines, "\n"),
@@ -113,10 +113,10 @@ function M.diff(bufnr, start0, old_lines, new_lines)
     end
   end
 
-  -- discoverability hint on the region's first line
-  local hint = math.max(0, math.min(start0, nbuf - 1))
-  vim.api.nvim_buf_set_extmark(bufnr, ns, hint, 0, {
-    virt_text = { { "  ⟪tabtab · <Tab> accept⟫", HINT_HL } },
+  -- discoverability hint on the region's first line ("jump" vs "accept")
+  local hint_line = math.max(0, math.min(start0, nbuf - 1))
+  vim.api.nvim_buf_set_extmark(bufnr, ns, hint_line, 0, {
+    virt_text = { { "  ⟪tabtab · " .. (hint or "<Tab> accept") .. "⟫", HINT_HL } },
     virt_text_pos = "eol",
   })
 end

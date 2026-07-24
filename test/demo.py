@@ -1,5 +1,5 @@
 # ============================================================
-#  tabtab.nvim playground
+#  neocursor.nvim playground
 #
 #  APPEND demo (inline ghost text):
 #    Put the cursor at the END of a stub in section 1, press `A` to
@@ -16,11 +16,11 @@
 # ---- section 1: append ---------------------------------------------
 
 def is_prime(n):
-    # return True if n is prime, else False
+    return True if n > 1 else False
 
 
 def quicksort(arr):
-
+    return sorted(arr)
 
 # ---- section 2: rewrite --------------------------------------------
 

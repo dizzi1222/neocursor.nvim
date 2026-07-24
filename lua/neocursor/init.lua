@@ -1,11 +1,11 @@
--- tabtab.nvim — Cursor Tab, in neovim.
+-- neocursor.nvim — Cursor Tab, in neovim.
 -- Talks to the Python sidecar over stdio; renders the suggested edit as inline
 -- ghost text (see preview.lua). <Tab> applies it.
 
 local M = {}
 
-local preview = require("tabtab.preview")
-local heuristics = require("tabtab.heuristics")
+local preview = require("neocursor.preview")
+local heuristics = require("neocursor.heuristics")
 local uv = vim.uv or vim.loop
 
 local state = {
@@ -22,14 +22,14 @@ local state = {
   dbase = {},     -- [bufnr] = { path, text } baseline snapshot for diffing
   dtraj = {},     -- [path]  = { {diff, ts}, ... } committed edit trajectory
   rejects = {},   -- [key]   = times the user dismissed this exact suggestion
-  log = {},       -- ring buffer of event strings for :TabtabLog
+  log = {},       -- ring buffer of event strings for :NeocursorLog
   log_buf = nil,
   log_dirty = false,
 }
 
 local function plugin_root()
   local src = debug.getinfo(1, "S").source:sub(2)
-  return vim.fn.fnamemodify(src, ":h:h:h") -- .../lua/tabtab/init.lua -> root
+  return vim.fn.fnamemodify(src, ":h:h:h") -- .../lua/neocursor/init.lua -> root
 end
 
 local function clear_suggestion()
@@ -40,7 +40,7 @@ local function clear_suggestion()
   state.queue = nil -- abandon any pending multi-edit chain
 end
 
--- Persistent event log rendered by :TabtabLog. Every request, response, render,
+-- Persistent event log rendered by :NeocursorLog. Every request, response, render,
 -- suppression, jump/accept, and sidecar event lands here, so the whole pipeline
 -- is visible at all times rather than in a notification that vanishes.
 local function log_refresh()
@@ -49,7 +49,7 @@ local function log_refresh()
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   local c = state.cfg or {}
   local lines = {
-    ("── tabtab ─ debounce=%sms · heuristics=%d · excludes=%d · sidecar=%s ──"):format(
+    ("── neocursor ─ debounce=%sms · heuristics=%d · excludes=%d · sidecar=%s ──"):format(
       c.debounce or "?", c.heuristics and #c.heuristics or 0,
       c.exclude_patterns and #c.exclude_patterns or 0,
       state.ready and "ready" or (state.job and "starting" or "down")),
@@ -239,7 +239,7 @@ local function handle_result(res)
     state.last_error = res.error
     log("ERR     #" .. tostring(res.id) .. "  " .. tostring(res.error))
     vim.schedule(function()
-      vim.notify("tabtab: " .. tostring(res.error), vim.log.levels.WARN)
+      vim.notify("neocursor: " .. tostring(res.error), vim.log.levels.WARN)
     end)
     return
   end
@@ -292,7 +292,7 @@ function M.start()
     on_exit = function() state.job = nil; state.ready = false; log("SIDECAR exited") end,
   })
   if job <= 0 then
-    vim.notify("tabtab: failed to launch sidecar", vim.log.levels.ERROR)
+    vim.notify("neocursor: failed to launch sidecar", vim.log.levels.ERROR)
     log("SIDECAR launch failed")
     return
   end
@@ -574,8 +574,8 @@ function M.log()
   if not (state.log_buf and vim.api.nvim_buf_is_valid(state.log_buf)) then
     state.log_buf = vim.api.nvim_create_buf(false, true)
     vim.bo[state.log_buf].bufhidden = "hide"
-    vim.bo[state.log_buf].filetype = "tabtablog"
-    pcall(vim.api.nvim_buf_set_name, state.log_buf, "tabtab://log")
+    vim.bo[state.log_buf].filetype = "neocursorlog"
+    pcall(vim.api.nvim_buf_set_name, state.log_buf, "neocursor://log")
   end
   for _, win in ipairs(vim.api.nvim_list_wins()) do
     if vim.api.nvim_win_get_buf(win) == state.log_buf then
@@ -591,7 +591,7 @@ function M.log()
   vim.cmd("wincmd p") -- keep focus where the user was typing
 end
 function M.has_suggestion() return state.suggestion ~= nil end
-function M.suggest() send_request() end -- manual trigger (:TabtabSuggest)
+function M.suggest() send_request() end -- manual trigger (:NeocursorSuggest)
 
 function M.setup(opts)
   opts = opts or {}
@@ -606,7 +606,7 @@ function M.setup(opts)
   }
   M.start()
 
-  local grp = vim.api.nvim_create_augroup("tabtab", { clear = true })
+  local grp = vim.api.nvim_create_augroup("neocursor", { clear = true })
   vim.api.nvim_create_autocmd({ "TextChangedI", "CursorMovedI" }, {
     group = grp,
     callback = function()
@@ -635,20 +635,20 @@ function M.setup(opts)
     vim.keymap.set("i", "<Tab>", function()
       if M.accept() then return "" end
       return "<Tab>"
-    end, { expr = true, replace_keycodes = true, desc = "tabtab: accept or tab" })
+    end, { expr = true, replace_keycodes = true, desc = "neocursor: accept or tab" })
   end
 
-  vim.keymap.set("i", "<C-]>", M.dismiss, { desc = "tabtab: dismiss" })
-  vim.api.nvim_create_user_command("TabtabSuggest", M.suggest, { desc = "request a suggestion now" })
-  vim.api.nvim_create_user_command("TabtabLog", M.log, { desc = "toggle the tabtab live log pane" })
+  vim.keymap.set("i", "<C-]>", M.dismiss, { desc = "neocursor: dismiss" })
+  vim.api.nvim_create_user_command("NeocursorSuggest", M.suggest, { desc = "request a suggestion now" })
+  vim.api.nvim_create_user_command("NeocursorLog", M.log, { desc = "toggle the neocursor live log pane" })
 
-  vim.api.nvim_create_user_command("TabtabDebug", function()
+  vim.api.nvim_create_user_command("NeocursorDebug", function()
     local s = state.suggestion
     local dbuf = vim.api.nvim_get_current_buf()
     local dlint = collect_linter_errors(dbuf, buf_relpath(dbuf))
     local dfdh = collect_file_diff_histories(dbuf, buf_relpath(dbuf))
     local lines = {
-      "── tabtab debug ──",
+      "── neocursor debug ──",
       "sidecar job : " .. tostring(state.job) .. (state.ready and "  READY" or "  (no ready signal)"),
       "requests    : seq=" .. tostring(state.seq) .. "  last_ok=" .. tostring(state.last_ok_at or "never"),
       "suggestion  : " .. (s and (s.mode .. "  lines=" .. #s.lines) or "none"),
@@ -665,9 +665,9 @@ function M.setup(opts)
       "last stderr : " .. tostring(state.last_stderr or "none"),
     }
     vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
-  end, { desc = "tabtab diagnostics" })
+  end, { desc = "neocursor diagnostics" })
 
-  vim.notify("tabtab ready — type in insert mode; <Tab> accepts", vim.log.levels.INFO)
+  vim.notify("neocursor ready — type in insert mode; <Tab> accepts", vim.log.levels.INFO)
 end
 
 return M

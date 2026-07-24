@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tabtab.nvim first light: real Tab completion from Cursor's StreamCpp."""
+"""neocursor.nvim first light: real Tab completion from Cursor's StreamCpp."""
 import os, json, base64, time, sqlite3, struct
 import httpx
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tabtab.nvim sidecar — persistent stdio server speaking Cursor's StreamCpp.
+neocursor.nvim sidecar — persistent stdio server speaking Cursor's StreamCpp.
 
 Protocol (one JSON object per line, both directions):
   in : {"id":N,"path":str,"content":str,"line":int0,"col":int0,"language":str,
@@ -271,7 +271,7 @@ def main():
     cfg = fetch_config()
     if cfg.get("cppUrl"):
         STREAM_URL = cfg["cppUrl"].rstrip("/") + "/aiserver.v1.AiService/StreamCpp"
-    sys.stderr.write("tabtab sidecar ready\n")
+    sys.stderr.write("neocursor sidecar ready\n")
     sys.stderr.flush()
     sys.stdout.write(json.dumps({"config": {
         "debounce": cfg.get("clientDebounceDurationMillis"),

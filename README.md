@@ -1,4 +1,4 @@
-# tabtab.nvim
+# neocursor.nvim
 
 Cursor's **Tab** — inline completions *and* diff-style rewrites — inside Neovim,
 streamed from Cursor's own backend.
@@ -30,17 +30,17 @@ The plugin sends the current buffer + cursor; the backend streams back an edit
 
 ```lua
 {
-  dir = "/path/to/tabtab.nvim",
-  name = "tabtab.nvim",
+  dir = "/path/to/neocursor.nvim",
+  name = "neocursor.nvim",
   event = "InsertEnter",
   config = function()
-    require("tabtab").setup({ map_tab = false }) -- let your completion engine own <Tab>
+    require("neocursor").setup({ map_tab = false }) -- let your completion engine own <Tab>
   end,
 }
 ```
 
 If another plugin owns `<Tab>` (nvim-cmp, blink.cmp…), have its Tab handler call
-`require("tabtab").accept()` first and fall through on `false`.
+`require("neocursor").accept()` first and fall through on `false`.
 
 ## Try it
 
@@ -51,7 +51,7 @@ nvim -u test/init.lua test/demo.py
 - **Append:** cursor at a line end in section 1, insert, pause → ghost → `<Tab>`.
 - **Rewrite:** cursor on `return a - b` in section 2, insert, nudge → red/green diff → `<Tab>`.
 
-Commands: `:TabtabSuggest` (force a request) · `:TabtabDebug` (diagnostics).
+Commands: `:NeocursorSuggest` (force a request) · `:NeocursorDebug` (diagnostics).
 
 ## Status
 

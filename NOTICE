@@ -1,7 +1,7 @@
-tabtab.nvim
+neocursor.nvim
 ===========
 
-The inline ghost-text rendering in lua/tabtab/preview.lua adapts a technique
+The inline ghost-text rendering in lua/neocursor/preview.lua adapts a technique
 from two MIT-licensed neovim plugins. Thanks to their authors.
 
   supermaven-nvim   https://github.com/supermaven-inc/supermaven-nvim
@@ -16,4 +16,4 @@ The specific ideas reused:
   * an undo breakpoint before applying, and a cursor-move guard after accept
 
 No source files were copied verbatim; the renderer was reimplemented against
-tabtab's own data flow (range-replacements streamed from Cursor's backend).
+neocursor's own data flow (range-replacements streamed from Cursor's backend).

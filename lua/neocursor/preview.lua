@@ -1,4 +1,4 @@
--- Ghost-text + diff renderer for tabtab.nvim.
+-- Ghost-text + diff renderer for neocursor.nvim.
 --
 -- Inline-suggestion technique adapted from supermaven-nvim / copilot.lua (NOTICE):
 -- one extmark, first line as `virt_text`, rest as `virt_lines`.
@@ -9,7 +9,7 @@
 
 local M = {}
 
-local ns = vim.api.nvim_create_namespace("tabtab")
+local ns = vim.api.nvim_create_namespace("neocursor")
 local HL = "Comment"
 local HINT_HL = "DiagnosticHint"
 local HAS_INLINE = vim.fn.has("nvim-0.10") == 1
@@ -29,11 +29,11 @@ local function ensure_hl()
   local dd = vim.api.nvim_get_hl(0, { name = "DiffDelete", link = false })
   local del = vim.tbl_deep_extend("force", {}, dd)
   del.strikethrough = true
-  vim.api.nvim_set_hl(0, "TabtabDelete", del)
-  vim.api.nvim_set_hl(0, "TabtabAdd", { link = "DiffAdd", default = true })
+  vim.api.nvim_set_hl(0, "NeocursorDelete", del)
+  vim.api.nvim_set_hl(0, "NeocursorAdd", { link = "DiffAdd", default = true })
 end
 ensure_hl()
-vim.api.nvim_create_autocmd("ColorScheme", { callback = ensure_hl, desc = "tabtab diff highlights" })
+vim.api.nvim_create_autocmd("ColorScheme", { callback = ensure_hl, desc = "neocursor diff highlights" })
 
 ---@return string first, table rest  -- rest = virt_lines chunks
 local function split_first(text)
@@ -83,7 +83,7 @@ function M.diff(bufnr, start0, old_lines, new_lines, hint)
         vim.api.nvim_buf_set_extmark(bufnr, ns, lnum, 0, {
           end_row = lnum,
           end_col = #content,
-          hl_group = "TabtabDelete",
+          hl_group = "NeocursorDelete",
           line_hl_group = "DiffDelete",
           hl_mode = "combine",
         })
@@ -95,7 +95,7 @@ function M.diff(bufnr, start0, old_lines, new_lines, hint)
       local vlines = {}
       for i = 0, cb - 1 do
         local l = new_lines[sb + i] or ""
-        vlines[#vlines + 1] = { { l == "" and " " or l, "TabtabAdd" } }
+        vlines[#vlines + 1] = { { l == "" and " " or l, "NeocursorAdd" } }
       end
       local anchor, above
       if ca > 0 then
@@ -116,7 +116,7 @@ function M.diff(bufnr, start0, old_lines, new_lines, hint)
   -- discoverability hint on the region's first line ("jump" vs "accept")
   local hint_line = math.max(0, math.min(start0, nbuf - 1))
   vim.api.nvim_buf_set_extmark(bufnr, ns, hint_line, 0, {
-    virt_text = { { "  ⟪tabtab · " .. (hint or "<Tab> accept") .. "⟫", HINT_HL } },
+    virt_text = { { "  ⟪neocursor · " .. (hint or "<Tab> accept") .. "⟫", HINT_HL } },
     virt_text_pos = "eol",
   })
 end

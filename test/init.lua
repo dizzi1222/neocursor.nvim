@@ -1,11 +1,13 @@
 -- Minimal, isolated test config for neocursor.nvim.
--- Run:  nvim -u /Users/beyond/neocursor.nvim/test/init.lua /Users/beyond/neocursor.nvim/test/demo.py
+-- Run from anywhere:  nvim -u <repo>/test/init.lua <repo>/test/demo.py
+local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h")
+
 vim.opt.compatible = false
 vim.opt.number = true
 vim.opt.signcolumn = "yes"
 vim.cmd("syntax on")
 
-vim.opt.rtp:prepend("/Users/beyond/neocursor.nvim")
+vim.opt.rtp:prepend(root)
 require("neocursor").setup({ debounce = 250 })
 
 -- tiny quality-of-life for testing

@@ -278,6 +278,7 @@ def main():
         "exclude_patterns": cfg.get("excludeRecentlyViewedFilesPatterns") or [],
         "heuristics": cfg.get("heuristics") or [],
         "reject_hard": (cfg.get("recentlyRejectedEditThresholds") or {}).get("hardRejectThreshold"),
+        "is_fused": cfg.get("isFusedCursorPredictionModel"),
     }}) + "\n")
     sys.stdout.flush()
     for line in sys.stdin:

@@ -10,6 +10,8 @@
 local M = {}
 
 local ns = vim.api.nvim_create_namespace("neocursor")
+-- own namespace so suggestion clears never kill a pending prediction hint
+local ns_pred = vim.api.nvim_create_namespace("neocursor_pred")
 local HL = "Comment"
 local HINT_HL = "DiagnosticHint"
 local HAS_INLINE = vim.fn.has("nvim-0.10") == 1
@@ -21,6 +23,19 @@ end
 function M.clear(bufnr)
   -- diff mode paints many extmarks, so clear the whole namespace, not one id
   pcall(vim.api.nvim_buf_clear_namespace, bufnr or 0, ns, 0, -1)
+end
+
+--- "Tab →" pill for the next cursor-prediction target (Cursor's hint widget).
+function M.prediction(bufnr, row0, label)
+  M.clear_prediction(bufnr)
+  vim.api.nvim_buf_set_extmark(bufnr, ns_pred, row0, 0, {
+    virt_text = { { "  ⟪" .. label .. "⟫", HINT_HL } },
+    virt_text_pos = "eol",
+  })
+end
+
+function M.clear_prediction(bufnr)
+  pcall(vim.api.nvim_buf_clear_namespace, bufnr or 0, ns_pred, 0, -1)
 end
 
 -- Highlight groups: additions link to DiffAdd; deletions copy DiffDelete's

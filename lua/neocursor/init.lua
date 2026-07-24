@@ -14,10 +14,13 @@ local state = {
   seq = 0,        -- request counter; replies with a stale id are ignored
   partial = "",   -- stdout line-reassembly buffer
   timer = nil,
-  suggestion = nil, -- { bufnr, start0, end0_excl, lines, mode }
+  suggestion = nil, -- { bufnr, start0, end0_excl, lines, mode, buf_lines }
   cfg = nil,
-  walking = false, -- true while applying a chain locally; suppresses auto-requests
+  seen = nil,     -- { buf, tick, row, col } last observed state; our own edits' echoes match it
+  req = nil,      -- { bufnr, tick } buffer identity+version of the in-flight request
   queue = nil,     -- { list = {edit,...}, idx } multi-edit chain from one response
+  prediction = nil, -- { path, line } next-jump target (cursorPredictionTarget)
+  pred_rejects = {}, -- [path:line] = {count, ts} — Cursor: 30s TTL, max 5, mute at 2
   viewed = {},    -- [bufnr] = ms of last BufEnter (recency for additionalFiles)
   dbase = {},     -- [bufnr] = { path, text } baseline snapshot for diffing
   dtraj = {},     -- [path]  = { {diff, ts}, ... } committed edit trajectory
@@ -38,6 +41,16 @@ local function clear_suggestion()
     state.suggestion = nil
   end
   state.queue = nil -- abandon any pending multi-edit chain
+end
+
+local function buf_relpath(b)
+  local n = vim.api.nvim_buf_get_name(b)
+  if n == "" then return nil end
+  return vim.fn.fnamemodify(n, ":.")
+end
+
+local function buf_text(b)
+  return table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
 end
 
 -- Persistent event log rendered by :NeocursorLog. Every request, response, render,
@@ -86,6 +99,7 @@ local function apply_config(cfg)
   if type(cfg.exclude_patterns) == "table" then state.cfg.exclude_patterns = cfg.exclude_patterns end
   if type(cfg.heuristics) == "table" then state.cfg.heuristics = cfg.heuristics end
   if type(cfg.reject_hard) == "number" then state.cfg.reject_hard = cfg.reject_hard end
+  if type(cfg.is_fused) == "boolean" then state.cfg.is_fused = cfg.is_fused end
   log(("CONFIG  debounce=%sms heuristics=%d excludes=%d"):format(
     state.cfg.debounce, #state.cfg.heuristics, #state.cfg.exclude_patterns))
 end
@@ -96,6 +110,22 @@ local function cursor_at(start0, end0_excl)
   local row0 = vim.api.nvim_win_get_cursor(0)[1] - 1
   if end0_excl <= start0 then return row0 == start0 end
   return row0 >= start0 and row0 < end0_excl
+end
+
+-- Record the buffer/cursor state our own edit or jump just produced. The
+-- TextChangedI/CursorMovedI events it enqueues only fire after we return to the
+-- main loop; they observe exactly this state and are swallowed by the autocmd's
+-- duplicate check, so applying or jumping never clears the suggestion/chain it
+-- just revealed. (A boolean guard can't do this — it's already reset by the
+-- time those events fire.)
+local function mark_seen(bufnr)
+  local cur = vim.api.nvim_win_get_cursor(0)
+  state.seen = {
+    buf = bufnr,
+    tick = vim.api.nvim_buf_get_changedtick(bufnr),
+    row = cur[1],
+    col = cur[2],
+  }
 end
 
 -- Render one edit. If its text simply extends what the user has already typed
@@ -113,7 +143,10 @@ local function show_edit(edit)
   if table.concat(cur_range, "\n") == text then return false end -- no-op
 
   local mode, ghost = "diff", nil
-  if start0 <= row1 - 1 then
+  -- inline only when the cursor sits inside the replaced range; a cursor past
+  -- its end would make the "prefix" include lines the edit doesn't replace,
+  -- and accepting would duplicate them
+  if start0 <= row1 - 1 and row1 - 1 < end0_excl then
     local ok, prefix_lines = pcall(vim.api.nvim_buf_get_text, bufnr, start0, 0, row1 - 1, col0, {})
     local after = vim.api.nvim_get_current_line():sub(col0 + 1)
     if ok and after:match("^%s*$") then
@@ -127,6 +160,7 @@ local function show_edit(edit)
 
   state.suggestion = {
     bufnr = bufnr, start0 = start0, end0_excl = end0_excl, lines = lines, mode = mode,
+    buf_lines = vim.api.nvim_buf_line_count(bufnr), -- re-anchors end0_excl as typing adds lines
   }
   if mode == "inline" then
     preview.inline(bufnr, row1 - 1, col0, ghost)
@@ -180,12 +214,86 @@ local function recently_removed(path)
   return set
 end
 
+-- Cursor-prediction rejection ledger, ported verbatim from their controller:
+-- keyed path:line, 30s expiry, at most 5 entries (evict oldest), and a target
+-- is only muted once it has been rejected twice (count >= 2).
+local PRED_REJECT_TTL, PRED_REJECT_MAX = 30 * 1000, 5
+
+local function pred_key(p) return (p.path or "") .. ":" .. tostring(p.line) end
+
+local function record_pred_reject(p)
+  local now = os.time() * 1000
+  local r = state.pred_rejects[pred_key(p)]
+  if r then
+    r.count, r.ts = r.count + 1, now
+  else
+    state.pred_rejects[pred_key(p)] = { count = 1, ts = now }
+  end
+  local n, oldest, okey = 0, math.huge, nil
+  for k, v in pairs(state.pred_rejects) do
+    n = n + 1
+    if v.ts < oldest then oldest, okey = v.ts, k end
+  end
+  if n > PRED_REJECT_MAX and okey then state.pred_rejects[okey] = nil end
+end
+
+local function pred_recently_rejected(p)
+  local now = os.time() * 1000
+  for k, v in pairs(state.pred_rejects) do
+    if now - v.ts > PRED_REJECT_TTL then state.pred_rejects[k] = nil end
+  end
+  local r = state.pred_rejects[pred_key(p)]
+  return r ~= nil and r.count >= 2
+end
+
+-- Paint the "Tab →" hint at the prediction target (Cursor's hint widget).
+-- Returns false when there is nothing worth jumping to (no prediction, or it
+-- points at the line the cursor is already on).
+local function show_prediction()
+  local p = state.prediction
+  if not (p and p.line) then return false end
+  local bufnr = vim.api.nvim_get_current_buf()
+  local rel = buf_relpath(bufnr)
+  if (not p.path) or p.path == rel then
+    local lc = vim.api.nvim_buf_line_count(bufnr)
+    local row1 = math.min(math.max(p.line, 1), lc)
+    if row1 == vim.api.nvim_win_get_cursor(0)[1] then return false end
+    preview.prediction(bufnr, row1 - 1, "<Tab> → L" .. row1)
+  else
+    -- cross-file target: anchor the hint at the cursor, name the destination
+    local cur0 = vim.api.nvim_win_get_cursor(0)[1] - 1
+    preview.prediction(bufnr, cur0, ("<Tab> → %s:%d"):format(p.path, p.line))
+  end
+  log(("PRED    → %s:%d"):format(p.path or "·", p.line))
+  return true
+end
+
 -- Build the edit queue from a sidecar result and show the first showable edit.
 local function render_result(res)
   local bufnr = vim.api.nvim_get_current_buf()
+  -- the response was computed against the buffer as of send time; if the user
+  -- switched buffers or typed since, its ranges no longer apply (a fresh
+  -- request is already debounce-pending) — rendering it would misplace edits
+  local rq = state.req
+  if rq and (rq.bufnr ~= bufnr or vim.api.nvim_buf_get_changedtick(bufnr) ~= rq.tick) then
+    log("DROP    stale response (buffer changed since request)")
+    return
+  end
+  -- adopt this response's prediction target (or drop a stale/muted one)
+  preview.clear_prediction(bufnr)
+  local pred = res.prediction
+  if pred and pred.line and not pred_recently_rejected(pred) then
+    state.prediction = pred
+  else
+    state.prediction = nil
+  end
   local edits_in = res.edits
   if not edits_in or #edits_in == 0 then
-    if (res.text or "") == "" then log("NOOP    empty response"); return end
+    if (res.text or "") == "" then
+      -- an empty edit list can still carry a prediction: pure "Tab → there"
+      if not show_prediction() then log("NOOP    empty response") end
+      return
+    end
     edits_in = { { text = res.text, range = res.range } } -- back-compat
   end
   local row1 = vim.api.nvim_win_get_cursor(0)[1]
@@ -216,12 +324,14 @@ local function render_result(res)
     return
   end
 
+  clear_suggestion() -- replace whatever was showing (e.g. a retained ghost)
   state.queue = { list = list, idx = 1 }
   while state.queue.idx <= #list do
     if show_edit(list[state.queue.idx]) then return end
     state.queue.idx = state.queue.idx + 1
   end
   state.queue = nil
+  if show_prediction() then return end -- all edits stale, but a jump remains
   log("NOOP    suggestion matches buffer")
 end
 
@@ -361,16 +471,6 @@ local function collect_additional_files(cur_buf)
   return files
 end
 
-local function buf_relpath(b)
-  local n = vim.api.nvim_buf_get_name(b)
-  if n == "" then return nil end
-  return vim.fn.fnamemodify(n, ":.")
-end
-
-local function buf_text(b)
-  return table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
-end
-
 local function cap(s, n)
   if #s > n then return s:sub(1, n) .. "\n… (truncated)" end
   return s
@@ -475,6 +575,7 @@ local function send_request()
   local adds = collect_additional_files(bufnr)
   local lint = collect_linter_errors(bufnr, rp)
   local fdh = collect_file_diff_histories(bufnr, rp)
+  state.req = { bufnr = bufnr, tick = vim.api.nvim_buf_get_changedtick(bufnr) }
   local req = {
     id = state.seq,
     path = path,
@@ -500,65 +601,257 @@ local function should_attach(bufnr)
   return true
 end
 
-local function schedule_request()
-  if not should_attach(vim.api.nvim_get_current_buf()) then return end
-  clear_suggestion()
+local function cancel_timer()
   if state.timer then
     state.timer:stop(); state.timer:close(); state.timer = nil
   end
+end
+
+-- keep=true preserves the on-screen suggestion (a retained ghost the user is
+-- typing through) while the refreshed request is in flight; the response then
+-- replaces it atomically in render_result.
+local function schedule_request(keep)
+  if not should_attach(vim.api.nvim_get_current_buf()) then return end
+  if not keep then clear_suggestion() end
+  cancel_timer()
   state.timer = uv.new_timer()
   state.timer:start(state.cfg.debounce, 0, vim.schedule_wrap(function()
-    if state.timer then state.timer:stop(); state.timer:close(); state.timer = nil end
+    cancel_timer()
     send_request()
   end))
 end
 
--- Apply the current edit, then reveal the next one (cursor stays put — the user
--- <Tab>s to jump to it). Buffer edits are illegal under textlock (E565) so defer
--- to the next tick. state.walking gates our own churn from triggering requests.
-local function accept_current(s)
-  local q = state.queue
+-- Typing through the ghost: if the inline suggestion still extends what the
+-- user has typed, shrink it in place instead of flickering it away; typing it
+-- out in full counts as an accept and walks the chain. Returns true when the
+-- suggestion survived (or was consumed) and must not be cleared.
+local function try_retain()
+  local s = state.suggestion
+  if not (s and s.mode == "inline" and vim.api.nvim_get_current_buf() == s.bufnr) then
+    return false
+  end
+  local lc = vim.api.nvim_buf_line_count(s.bufnr)
+  local delta = lc - (s.buf_lines or lc)
+  if delta ~= 0 then -- a newline typed inside the range: re-anchor the tail
+    s.end0_excl = s.end0_excl + delta
+    if state.queue then
+      for k = state.queue.idx + 1, #state.queue.list do
+        local e = state.queue.list[k]
+        if e.start0 >= s.end0_excl - delta then
+          e.start0, e.end0_excl = e.start0 + delta, e.end0_excl + delta
+        end
+      end
+    end
+  end
+  if s.end0_excl > lc or s.end0_excl <= s.start0 then return false end
+  if not show_edit(s) then -- region now equals the suggestion: typed out in full
+    preview.clear(s.bufnr)
+    state.suggestion = nil
+    log("CONSUME L" .. (s.start0 + 1) .. "  typed through")
+    advance_after_apply(s)
+    return true
+  end
+  if state.suggestion.mode ~= "inline" then return false end -- deviated; drop it
+  return true
+end
+
+-- Cursor moves made while an expr mapping evaluates are silently REVERTED when
+-- the evaluation ends (:h expr-mapping "the cursor position is restored") —
+-- blink/cmp integrations call M.accept() from exactly such mappings, and nvim
+-- restores the cursor even though it now permits the buffer edit itself. So:
+-- move synchronously (correct for our own callback mapping), then verify one
+-- tick later — post-eval, where moving is legal — and re-apply if it was undone.
+local function enforce_cursor(bufnr, pos)
+  vim.schedule(function()
+    if vim.api.nvim_get_current_buf() ~= bufnr then return end
+    local cur = vim.api.nvim_win_get_cursor(0)
+    if cur[1] ~= pos[1] or cur[2] ~= pos[2] then
+      pcall(vim.api.nvim_win_set_cursor, 0, pos)
+      mark_seen(bufnr) -- the enforced move fires its own echo; swallow it too
+    end
+  end)
+end
+
+-- Apply the edit under the cursor, then reveal the next one in the chain — all
+-- synchronously, so a rapid tab-tab-tab can never slip a literal <Tab> into the
+-- buffer between apply and re-render. The cursor stays at the applied edit; the
+-- next <Tab> JUMPS to the revealed one (Cursor's cursorAtInlineEdit rule).
+local function do_accept(s)
+  if not vim.api.nvim_buf_is_valid(s.bufnr) then return end
   preview.clear(s.bufnr)
   state.suggestion = nil
-  vim.schedule(function()
-    if not vim.api.nvim_buf_is_valid(s.bufnr) then return end
-    state.walking = true
-    vim.cmd("let &undolevels=&undolevels") -- one undo reverts the whole accept
-    vim.api.nvim_buf_set_lines(s.bufnr, s.start0, s.end0_excl, false, s.lines)
-    pcall(vim.api.nvim_win_set_cursor, 0, { s.start0 + #s.lines, #(s.lines[#s.lines] or "") })
-    state.queue = q
-    advance_after_apply(s) -- local; no network
-    state.walking = false
-  end)
+  cancel_timer() -- a request scheduled before the accept would race the chain
+  vim.cmd("let &undolevels=&undolevels") -- one undo reverts the whole accept
+  local lc = vim.api.nvim_buf_line_count(s.bufnr)
+  vim.api.nvim_buf_set_lines(s.bufnr, s.start0, math.min(s.end0_excl, lc), false, s.lines)
+  local pos = { s.start0 + #s.lines, #(s.lines[#s.lines] or "") }
+  pcall(vim.api.nvim_win_set_cursor, 0, pos)
+  mark_seen(s.bufnr)
+  advance_after_apply(s) -- local; no network
+  enforce_cursor(s.bufnr, pos)
+  if not state.suggestion then
+    -- chain done: hand Tab over to the cursor prediction if the server sent
+    -- one (Cursor's maybeShowHintLineWidget + retrigger-on-accept); otherwise
+    -- just fetch a fresh suggestion here
+    if not show_prediction() then
+      state.prediction = nil
+      schedule_request()
+    end
+  end
 end
 
 -- Move the cursor onto the edit (local, instant). This flips cursorAtInlineEdit
 -- true, so the NEXT <Tab> accepts. Preview stays; its hint refreshes to "accept".
-local function jump_to(s)
-  vim.schedule(function()
-    if not vim.api.nvim_buf_is_valid(s.bufnr) then return end
-    state.walking = true
-    local lc = vim.api.nvim_buf_line_count(s.bufnr)
-    pcall(vim.api.nvim_win_set_cursor, 0, { math.min(s.start0 + 1, lc), 0 })
-    show_edit(s)
-    state.walking = false
-  end)
+local function do_jump(s)
+  if not vim.api.nvim_buf_is_valid(s.bufnr) then return end
+  local lc = vim.api.nvim_buf_line_count(s.bufnr)
+  local pos = { math.min(s.start0 + 1, lc), 0 }
+  vim.api.nvim_win_set_cursor(0, pos)
+  show_edit(s)
+  mark_seen(s.bufnr)
+  enforce_cursor(s.bufnr, pos)
 end
 
--- <Tab> handler: jump-first, accept-second — Cursor's two-phase feel. Returns
--- true synchronously so the caller (blink / expr map) knows Tab was consumed.
+-- Our own <Tab> mapping runs free of textlock, so fn runs synchronously. An
+-- expr-map integrator (blink/cmp fallback chains) calls M.accept() under
+-- textlock, where buffer/cursor changes throw — retry those once, deferred.
+local function run_or_defer(fn, s)
+  local ok, err = pcall(fn, s)
+  if not ok then
+    local msg = tostring(err)
+    if msg:find("E565") or msg:find("E523") or msg:find("textlock") then
+      vim.schedule(function()
+        local ok2, err2 = pcall(fn, s)
+        if not ok2 then log("ERR     apply failed: " .. tostring(err2)) end
+      end)
+    else
+      log("ERR     apply failed: " .. msg)
+    end
+  end
+end
+
+-- Jump to the server's predicted next location (Cursor's tabToLineBefore-
+-- AcceptingCpp): m' first so <C-o>/'' goes back, land at the line's first
+-- non-blank column, then retrigger immediately — the next suggestion appears
+-- at the landing point with no debounce. Cross-file targets open the file.
+local function do_accept_prediction(p)
+  preview.clear_prediction(0)
+  state.prediction = nil
+  cancel_timer()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local rel = buf_relpath(bufnr)
+  if p.path and rel and p.path ~= rel then
+    vim.cmd("edit " .. vim.fn.fnameescape(p.path))
+    bufnr = vim.api.nvim_get_current_buf()
+  end
+  local lc = vim.api.nvim_buf_line_count(bufnr)
+  local row = math.min(math.max(p.line or 1, 1), lc)
+  pcall(vim.cmd, "normal! m'") -- jumplist entry = the go-back affordance
+  local line = vim.api.nvim_buf_get_lines(bufnr, row - 1, row, false)[1] or ""
+  local col = (line:find("%S") or (#line + 1)) - 1
+  local pos = { row, col }
+  vim.api.nvim_win_set_cursor(0, pos)
+  mark_seen(bufnr)
+  enforce_cursor(bufnr, pos)
+  log(("PREDGO  %s:%d"):format(p.path or "·", row))
+  send_request() -- retriggerCppOnAccept
+end
+
+-- Cursor's shouldTabInsteadOfAccepting: on a blank line, Tab should indent,
+-- not accept — but only for non-fused models (their check), and never for an
+-- inline ghost sitting right at the cursor.
+local function tab_should_indent(s)
+  if state.cfg.is_fused ~= false then return false end
+  if s.mode == "inline" then return false end
+  return vim.api.nvim_get_current_line():match("^%s*$") ~= nil
+end
+
+-- <Tab> handler, Cursor's full priority order: pending edit (jump-first,
+-- accept-second) → cursor prediction jump → nothing (caller falls back to a
+-- literal tab). Returns true when Tab was consumed.
 function M.accept()
   local s = state.suggestion
-  if not s then return false end
-  if cursor_at(s.start0, s.end0_excl) then
-    log("ACCEPT  L" .. (s.start0 + 1))
-    accept_current(s)
-  else
-    log("JUMP    L" .. (s.start0 + 1))
-    jump_to(s)
+  if s then
+    if vim.api.nvim_get_current_buf() ~= s.bufnr then
+      clear_suggestion() -- suggestion belongs to another buffer; Tab stays a tab
+      return false
+    end
+    if cursor_at(s.start0, s.end0_excl) then
+      if tab_should_indent(s) then return false end
+      log("ACCEPT  L" .. (s.start0 + 1))
+      run_or_defer(do_accept, s)
+    else
+      log("JUMP    L" .. (s.start0 + 1))
+      run_or_defer(do_jump, s)
+    end
+    return true
   end
+  local p = state.prediction
+  if p then
+    run_or_defer(do_accept_prediction, p)
+    return true
+  end
+  return false
+end
+
+-- Accept only the next word of an inline ghost (Cursor's acceptCppPartial):
+-- insert the fragment, shrink the ghost in place, and when the last fragment
+-- lands, walk the chain exactly like a full accept.
+local function do_accept_partial(s)
+  local bufnr = s.bufnr
+  local cur = vim.api.nvim_win_get_cursor(0)
+  local row1, col0 = cur[1], cur[2]
+  local ok, prefix_lines = pcall(vim.api.nvim_buf_get_text, bufnr, s.start0, 0, row1 - 1, col0, {})
+  if not ok then return end
+  local text = table.concat(s.lines, "\n")
+  local prefix = table.concat(prefix_lines, "\n")
+  if text:sub(1, #prefix) ~= prefix then return end
+  local ghost = text:sub(#prefix + 1)
+  if ghost == "" then return end
+  -- next word = leading blanks + one non-blank run; a leading newline is taken
+  -- alone with its indentation (accepting the line break)
+  local frag = ghost:match("^\n%s*") or ghost:match("^%s*[^%s]+") or ghost
+  local flines = vim.split(frag, "\n", { plain = true })
+  vim.api.nvim_buf_set_text(bufnr, row1 - 1, col0, row1 - 1, col0, flines)
+  local nrow1 = row1 + #flines - 1
+  local ncol = #flines > 1 and #flines[#flines] or (col0 + #frag)
+  pcall(vim.api.nvim_win_set_cursor, 0, { nrow1, ncol })
+  mark_seen(bufnr)
+  local lc = vim.api.nvim_buf_line_count(bufnr)
+  local delta = lc - (s.buf_lines or lc)
+  if delta ~= 0 then
+    s.end0_excl = s.end0_excl + delta
+    if state.queue then
+      for k = state.queue.idx + 1, #state.queue.list do
+        local e = state.queue.list[k]
+        if e.start0 >= s.end0_excl - delta then
+          e.start0, e.end0_excl = e.start0 + delta, e.end0_excl + delta
+        end
+      end
+    end
+  end
+  log(("PARTIAL L%d  +%d ch"):format(s.start0 + 1, #frag))
+  if not show_edit(s) then -- ghost fully consumed: behaves like a full accept
+    preview.clear(bufnr)
+    state.suggestion = nil
+    advance_after_apply(s)
+    if not state.suggestion and not show_prediction() then
+      state.prediction = nil
+      schedule_request()
+    end
+  end
+  enforce_cursor(bufnr, { nrow1, ncol })
+end
+
+function M.accept_partial()
+  local s = state.suggestion
+  if not (s and s.mode == "inline" and vim.api.nvim_get_current_buf() == s.bufnr) then
+    return false
+  end
+  run_or_defer(do_accept_partial, s)
   return true
 end
+function M.has_prediction() return state.prediction ~= nil end
 
 function M.dismiss()
   local s = state.suggestion
@@ -566,6 +859,11 @@ function M.dismiss()
     local key = reject_key(vim.fn.expand("%:."), s)
     state.rejects[key] = (state.rejects[key] or 0) + 1
     log(("DISMISS L%d  (rejected ×%d)"):format(s.start0 + 1, state.rejects[key]))
+  end
+  if state.prediction then
+    record_pred_reject(state.prediction) -- muted after 2 rejections within 30s
+    state.prediction = nil
+    preview.clear_prediction(0)
   end
   clear_suggestion()
 end
@@ -593,6 +891,18 @@ end
 function M.has_suggestion() return state.suggestion ~= nil end
 function M.suggest() send_request() end -- manual trigger (:NeocursorSuggest)
 
+-- Kill the sidecar and reset transient state. Lets setup() be re-run with a
+-- different sidecar_cmd (specs swap in a canned sidecar mid-session).
+function M.stop()
+  if state.job then
+    vim.fn.jobstop(state.job)
+    state.job = nil
+  end
+  state.ready = false
+  cancel_timer()
+  clear_suggestion()
+end
+
 function M.setup(opts)
   opts = opts or {}
   state.cfg = {
@@ -603,6 +913,10 @@ function M.setup(opts)
     exclude_patterns = {},           -- filled from CppConfig (skip .env/.pem/... as context)
     heuristics = {},                 -- filled from CppConfig (active suppression rules)
     reject_hard = 2,
+    is_fused = nil,                  -- CppConfig isFusedCursorPredictionModel (nil = unknown)
+    map_partial = opts.map_partial ~= false
+      and (type(opts.map_partial) == "string" and opts.map_partial or "<M-Right>")
+      or nil,
   }
   M.start()
 
@@ -610,15 +924,51 @@ function M.setup(opts)
   vim.api.nvim_create_autocmd({ "TextChangedI", "CursorMovedI" }, {
     group = grp,
     callback = function()
-      if state.walking then return end -- our own edits/jumps while walking a chain
-      schedule_request()
+      local buf = vim.api.nvim_get_current_buf()
+      local cur = vim.api.nvim_win_get_cursor(0)
+      local tick = vim.api.nvim_buf_get_changedtick(buf)
+      local seen = state.seen
+      state.seen = { buf = buf, tick = tick, row = cur[1], col = cur[2] }
+      -- identical state = the echo of our own apply/jump, or the second of the
+      -- two events one keystroke fires — nothing actually happened
+      if seen and seen.buf == buf and seen.tick == tick
+        and seen.row == cur[1] and seen.col == cur[2] then
+        return
+      end
+      local typed = not seen or seen.buf ~= buf or seen.tick ~= tick
+      if typed then
+        if try_retain() then
+          schedule_request(true) -- ghost survives; refresh in the background
+        else
+          schedule_request()     -- deviated from the suggestion: clear and refetch
+        end
+      else
+        -- pure cursor movement: a pending edit stays visible (Cursor keeps its
+        -- inline edit alive across moves — <Tab> jumps to it from anywhere; the
+        -- backend also won't reliably re-offer an edit after a 1-column move).
+        -- Re-render to re-anchor the jump⇄accept hint, refetch in background.
+        local s = state.suggestion
+        if s and vim.api.nvim_get_current_buf() == s.bufnr then
+          show_edit(s)
+          schedule_request(true)
+        else
+          schedule_request()
+        end
+      end
     end,
+  })
+  vim.api.nvim_create_autocmd("InsertEnter", {
+    group = grp,
+    callback = function() schedule_request(true) end, -- request at the entry point
   })
   vim.api.nvim_create_autocmd({ "InsertLeave", "BufLeave" }, {
     group = grp,
     callback = function(args)
       commit_diff(args.buf) -- coalesce the just-finished edit into the trajectory
+      cancel_timer()        -- don't fire a request for a buffer we just left
       clear_suggestion()
+      state.prediction = nil
+      preview.clear_prediction(args.buf)
     end,
   })
   vim.api.nvim_create_autocmd("BufEnter", {
@@ -632,10 +982,24 @@ function M.setup(opts)
   })
 
   if state.cfg.map_tab then
+    -- A callback mapping, not an expr map: expr evaluation runs under textlock,
+    -- which forces the apply onto the next tick — and a fast tab-tab would slip
+    -- a literal <Tab> into the buffer in between. Here the accept is
+    -- synchronous; only a no-suggestion Tab falls through.
     vim.keymap.set("i", "<Tab>", function()
-      if M.accept() then return "" end
-      return "<Tab>"
-    end, { expr = true, replace_keycodes = true, desc = "neocursor: accept or tab" })
+      if M.accept() then return end
+      local tab = vim.api.nvim_replace_termcodes("<Tab>", true, false, true)
+      vim.api.nvim_feedkeys(tab, "n", false)
+    end, { desc = "neocursor: accept / jump / literal tab" })
+  end
+
+  if state.cfg.map_partial then
+    local pkey = state.cfg.map_partial
+    vim.keymap.set("i", pkey, function()
+      if M.accept_partial() then return end
+      local orig = vim.api.nvim_replace_termcodes(pkey, true, false, true)
+      vim.api.nvim_feedkeys(orig, "n", false)
+    end, { desc = "neocursor: accept next word of ghost" })
   end
 
   vim.keymap.set("i", "<C-]>", M.dismiss, { desc = "neocursor: dismiss" })

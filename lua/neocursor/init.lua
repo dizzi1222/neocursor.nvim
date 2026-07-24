@@ -28,6 +28,7 @@ local state = {
   log = {},       -- ring buffer of event strings for :NeocursorLog
   log_buf = nil,
   log_dirty = false,
+  awaiting = false, -- a request is in flight (sent, no reply yet) — dashboard phase
 }
 
 local function plugin_root()
@@ -53,31 +54,90 @@ local function buf_text(b)
   return table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
 end
 
--- Persistent event log rendered by :NeocursorLog. Every request, response, render,
--- suppression, jump/accept, and sidecar event lands here, so the whole pipeline
--- is visible at all times rather than in a notification that vanishes.
+-- Relative "N seconds/minutes ago" for the dashboard's clock fields.
+local function ago(t)
+  if not t then return "never" end
+  local d = os.time() - t
+  if d <= 0 then return "now" end
+  if d < 60 then return d .. "s ago" end
+  return math.floor(d / 60) .. "m ago"
+end
+
+-- Persistent debug surface rendered by :NeocursorLog. The top block is a LIVE
+-- dashboard of the state machine — the phase we're in, what <Tab> would do at
+-- this instant (Cursor's cursorAtInlineEdit rule), the self-echo guard, the
+-- prediction ledger, the debounce timer — so the *current* dynamics are legible
+-- without reading the history backwards. Below the separator: the event log,
+-- newest first, so the freshest line sits right under the dashboard. Both the
+-- dashboard and the latest events stay on screen at any window height (the view
+-- is pinned to the top), which is why the log is reversed rather than tailed.
 local function log_refresh()
   state.log_dirty = false
   local buf = state.log_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   local c = state.cfg or {}
+  local s = state.suggestion
+
+  -- what a <Tab> press would do RIGHT NOW (inlined cursorAtInlineEdit)
+  local tab_now
+  if s and vim.api.nvim_buf_is_valid(s.bufnr) then
+    if vim.api.nvim_get_current_buf() ~= s.bufnr then
+      tab_now = "— other buf"
+    else
+      local row0 = vim.api.nvim_win_get_cursor(0)[1] - 1
+      local at = (s.end0_excl <= s.start0) and (row0 == s.start0)
+        or (row0 >= s.start0 and row0 < s.end0_excl)
+      tab_now = at and "ACCEPT edit" or ("JUMP → L" .. (s.start0 + 1))
+    end
+  elseif state.prediction then
+    tab_now = "PREDICT jump"
+  else
+    tab_now = "literal ⇥"
+  end
+
+  -- which node of the pipeline we're sitting in
+  local phase
+  if s then phase = state.queue and "CHAINING" or "SHOWING"
+  elseif state.timer then phase = "DEBOUNCING"
+  elseif state.awaiting then phase = "IN-FLIGHT"
+  else phase = "IDLE" end
+
+  local pred = "none"
+  if state.prediction then
+    local p = state.prediction
+    local r = state.pred_rejects[(p.path or "") .. ":" .. tostring(p.line)]
+    pred = ("%s:%s%s"):format(p.path or "·", tostring(p.line),
+      r and (r.count >= 2 and "  ⌀muted" or ("  rej×" .. r.count)) or "")
+  end
+
+  local sidecar = state.ready and "● ready" or (state.job and "◐ starting" or "○ down")
+  local sugg = s and ("%s L%d · %d ln"):format(s.mode, s.start0 + 1, #s.lines) or "none"
+  local chain = state.queue and (state.queue.idx .. "/" .. #state.queue.list) or "—"
+  local seen = state.seen
+    and ("L%d:%d ↻%s"):format(state.seen.row, state.seen.col, tostring(state.seen.tick))
+    or "—"
+  local fused = c.is_fused == nil and "?" or tostring(c.is_fused)
+
+  local bar = string.rep("─", 58)
   local lines = {
-    ("── neocursor ─ debounce=%sms · heuristics=%d · excludes=%d · sidecar=%s ──"):format(
-      c.debounce or "?", c.heuristics and #c.heuristics or 0,
-      c.exclude_patterns and #c.exclude_patterns or 0,
-      state.ready and "ready" or (state.job and "starting" or "down")),
-    ("seq=%d  chain=%s  last_error=%s"):format(
-      state.seq, state.queue and (state.queue.idx .. "/" .. #state.queue.list) or "none",
-      tostring(state.last_error or "none")),
-    "",
+    "┌" .. bar .. "┐",
+    ("  phase   ▸ %-12s   sidecar   %s  (job %s)"):format(phase, sidecar, tostring(state.job or "-")),
+    ("  TAB now ▸ %-12s   seq %d · last ok %s"):format(tab_now, state.seq, ago(state.last_ok_at)),
+    ("  suggest   %-16s  debounce %sms · timer %s"):format(sugg, c.debounce or "?", state.timer and "ticking" or "idle"),
+    ("  chain     %-16s  heur %d · excl %d · fused %s"):format(chain,
+      c.heuristics and #c.heuristics or 0, c.exclude_patterns and #c.exclude_patterns or 0, fused),
+    ("  predict   %-16s  guard(seen) %s"):format(pred, seen),
+    ("  err %s · suppress %s"):format(tostring(state.last_error or "none"), tostring(state.last_suppressed or "none")),
+    "├─ log ─ newest first " .. string.rep("─", 37) .. "┤",
   }
-  for _, l in ipairs(state.log) do lines[#lines + 1] = l end
+  for i = #state.log, 1, -1 do lines[#lines + 1] = state.log[i] end
+
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
   for _, win in ipairs(vim.api.nvim_list_wins()) do
     if vim.api.nvim_win_get_buf(win) == buf then
-      pcall(vim.api.nvim_win_set_cursor, win, { #lines, 0 })
+      pcall(vim.api.nvim_win_set_cursor, win, { 1, 0 }) -- pin to top: dashboard always visible
     end
   end
 end
@@ -345,6 +405,7 @@ local function result_summary(res)
 end
 
 local function handle_result(res)
+  state.awaiting = false -- a reply landed (fresh or stale); the flight is over
   if res.error then
     state.last_error = res.error
     log("ERR     #" .. tostring(res.id) .. "  " .. tostring(res.error))
@@ -399,7 +460,7 @@ function M.start()
   local job = vim.fn.jobstart(cmd, {
     on_stdout = on_stdout,
     on_stderr = on_stderr,
-    on_exit = function() state.job = nil; state.ready = false; log("SIDECAR exited") end,
+    on_exit = function() state.job = nil; state.ready = false; state.awaiting = false; log("SIDECAR exited") end,
   })
   if job <= 0 then
     vim.notify("neocursor: failed to launch sidecar", vim.log.levels.ERROR)
@@ -588,6 +649,7 @@ local function send_request()
     file_diff_histories = fdh,
   }
   vim.fn.chansend(state.job, vim.json.encode(req) .. "\n")
+  state.awaiting = true
   log(("REQ     #%d  %s %d:%d  ctx=%d diffs=%d lint=%d"):format(
     state.seq, path, cur[1] - 1, cur[2], #adds, fdh and #fdh or 0, lint and #lint.errors or 0))
 end
@@ -881,7 +943,7 @@ function M.log()
       return
     end
   end
-  vim.cmd("botright 14split")
+  vim.cmd("botright 20split")
   local win = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(win, state.log_buf)
   vim.wo[win].number, vim.wo[win].relativenumber, vim.wo[win].wrap = false, false, false

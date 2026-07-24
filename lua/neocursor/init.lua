@@ -19,6 +19,8 @@ local state = {
   seen = nil,     -- { buf, tick, row, col } last observed state; our own edits' echoes match it
   req = nil,      -- { bufnr, tick } buffer identity+version of the in-flight request
   req_ticks = {}, -- [id] = { bufnr, tick } per request, for rescuing late replies
+  last_edit_at = nil, -- os.time() of the last real text edit (Cursor's lastEditTime)
+  last_line = nil,    -- last cursor row seen, to detect line changes (Cursor's lastLine)
   queue = nil,     -- { list = {edit,...}, idx } multi-edit chain from one response
   prediction = nil, -- { path, line } next-jump target (cursorPredictionTarget)
   pred_rejects = {}, -- [path:line] = {count, ts} — Cursor: 30s TTL, max 5, mute at 2
@@ -1014,18 +1016,25 @@ function M.setup(opts)
   local grp = vim.api.nvim_create_augroup("neocursor", { clear = true })
   vim.api.nvim_create_autocmd({ "TextChangedI", "CursorMovedI" }, {
     group = grp,
-    callback = function()
+    callback = function(args)
       local buf = vim.api.nvim_get_current_buf()
       local cur = vim.api.nvim_win_get_cursor(0)
       local tick = vim.api.nvim_buf_get_changedtick(buf)
       local seen = state.seen
       state.seen = { buf = buf, tick = tick, row = cur[1], col = cur[2] }
+      -- A real text edit is authoritatively the TextChangedI event (Cursor's
+      -- onDidChangeContent → lastEditTime). The tick heuristic below can't tell
+      -- a genuine edit from a buffer switch, so the reading-code clock keys off
+      -- the event name instead.
+      if args.event == "TextChangedI" then state.last_edit_at = os.time() end
       -- identical state = the echo of our own apply/jump, or the second of the
       -- two events one keystroke fires — nothing actually happened
       if seen and seen.buf == buf and seen.tick == tick
         and seen.row == cur[1] and seen.col == cur[2] then
         return
       end
+      local prev_line = state.last_line
+      state.last_line = cur[1]
       local typed = not seen or seen.buf ~= buf or seen.tick ~= tick
       if typed then
         if try_retain() then
@@ -1034,23 +1043,30 @@ function M.setup(opts)
           schedule_request()     -- deviated from the suggestion: clear and refetch
         end
       else
-        -- pure cursor movement: a pending edit stays visible (Cursor keeps its
-        -- inline edit alive across moves — <Tab> jumps to it from anywhere; the
-        -- backend also won't reliably re-offer an edit after a 1-column move).
-        -- Re-render to re-anchor the jump⇄accept hint, refetch in background.
+        -- Pure cursor movement. Cursor's onDidChangeCursorPosition fires a
+        -- request ONLY on a line change, and never while "reading code" (no
+        -- edit in the last 60s) — a within-line move or idle navigation sends
+        -- nothing. A visible suggestion is kept alive across moves (its hint is
+        -- re-anchored), matching Cursor keeping the inline edit as a jump target.
         local s = state.suggestion
         if s and vim.api.nvim_get_current_buf() == s.bufnr then
-          show_edit(s)
-          schedule_request(true)
+          show_edit(s) -- re-anchor the jump⇄accept hint; no new request while shown
         else
-          schedule_request()
+          local line_changed = prev_line ~= cur[1]
+          local reading = not state.last_edit_at or (os.time() - state.last_edit_at) >= 60
+          if line_changed and not reading then
+            schedule_request()
+          end
         end
       end
     end,
   })
   vim.api.nvim_create_autocmd("InsertEnter", {
     group = grp,
-    callback = function() schedule_request(true) end, -- request at the entry point
+    callback = function()
+      state.last_line = vim.api.nvim_win_get_cursor(0)[1] -- baseline; first move isn't a "line change"
+      schedule_request(true) -- request at the entry point
+    end,
   })
   vim.api.nvim_create_autocmd({ "InsertLeave", "BufLeave" }, {
     group = grp,

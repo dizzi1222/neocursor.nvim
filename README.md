@@ -165,3 +165,7 @@ Anysphere / Cursor. It uses *your own* account; the token never leaves your
 machine. It talks to Cursor's private API, which is undocumented and may change,
 and using it may not fit Cursor's ToS — that's between you and Cursor. No Cursor
 source is redistributed. Use at your own risk.
+
+## License
+
+[MIT](./LICENSE). Rendering-technique attribution lives in [`NOTICE`](./NOTICE).

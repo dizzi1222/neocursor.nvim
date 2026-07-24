@@ -17,7 +17,7 @@ line/col in the request are 0-indexed (neovim). range in the reply is
 
 Launch:  uv run --with 'httpx[http2]' sidecar.py
 """
-import os, sys, json, base64, time, sqlite3, struct, socket, subprocess
+import os, sys, json, base64, time, sqlite3, struct, socket, subprocess, threading
 import httpx
 
 # --- resolver resilience -----------------------------------------------------
@@ -87,16 +87,6 @@ def checksum(mid: str, mac: str) -> str:
 
 def frame(b: bytes) -> bytes:
     return b"\x00" + struct.pack(">I", len(b)) + b
-
-
-def deframe(buf: bytes):
-    i = 0
-    while i + 5 <= len(buf):
-        flag = buf[i]
-        ln = struct.unpack(">I", buf[i + 1 : i + 5])[0]
-        i += 5
-        yield flag, buf[i : i + ln]
-        i += ln
 
 
 TOK = read_token()
@@ -175,7 +165,7 @@ def _linter(l: dict) -> dict:
     return {"relativeWorkspacePath": l.get("path") or "untitled", "errors": errors}
 
 
-def complete(req: dict) -> dict:
+def complete(req: dict, cancelled=lambda: False):
     body = {
         "currentFile": {
             "relativeWorkspacePath": req.get("path") or "untitled",
@@ -200,7 +190,6 @@ def complete(req: dict) -> dict:
     h = dict(HEADERS)
     h["authorization"] = f"Bearer {TOK}"
     h["x-cursor-checksum"] = checksum(MID, MAC)
-    r = CLIENT.post(STREAM_URL, content=frame(json.dumps(body).encode()), headers=h)
 
     # The multidiff model streams a SEQUENCE of edits in one response, each
     # bracketed by beginEdit/doneEdit, plus a cursorPredictionTarget pointing at
@@ -220,22 +209,23 @@ def complete(req: dict) -> dict:
             edits.append({"text": t, "range": cur["range"]})
         cur = None
 
-    for flag, msg in deframe(r.content):
+    def feed(flag, msg):
+        nonlocal cur, prediction
         if flag & 0x02:
-            continue
+            return
         try:
             j = json.loads(msg)
         except Exception:
-            continue
+            return
         if j.get("beginEdit"):
             flush()
             cur = {"text": "", "range": None, "eol": False}
-            continue
+            return
         if "text" in j:
             if cur is None:
                 cur = {"text": "", "range": None, "eol": False}
             cur["text"] += j.get("text", "")
-            continue
+            return
         rr = j.get("rangeToReplace")
         if rr:
             if cur is None:
@@ -246,7 +236,7 @@ def complete(req: dict) -> dict:
             }
             if j.get("shouldRemoveLeadingEol"):
                 cur["eol"] = True
-            continue
+            return
         cpt = j.get("cursorPredictionTarget")
         if cpt and prediction is None:
             prediction = {
@@ -255,6 +245,26 @@ def complete(req: dict) -> dict:
             }
         if j.get("doneEdit"):
             flush()
+
+    # Stream the reply and bail between chunks once superseded: exiting the
+    # `with` closes the HTTP/2 stream, i.e. Cursor's cancelCpp-on-abort. The
+    # connect frames (1B flag + 4B len) can split across chunks, so buffer.
+    buf = b""
+    with CLIENT.stream(
+        "POST", STREAM_URL, content=frame(json.dumps(body).encode()), headers=h
+    ) as r:
+        for chunk in r.iter_bytes():
+            if cancelled():
+                return None
+            buf += chunk
+            while len(buf) >= 5:
+                ln = struct.unpack(">I", buf[1:5])[0]
+                if len(buf) < 5 + ln:
+                    break
+                feed(buf[0], buf[5 : 5 + ln])
+                buf = buf[5 + ln :]
+    if cancelled():
+        return None
     flush()  # in case the stream ends mid-edit
 
     first = edits[0] if edits else {"text": "", "range": None}
@@ -281,20 +291,51 @@ def main():
         "is_fused": cfg.get("isFusedCursorPredictionModel"),
     }}) + "\n")
     sys.stdout.flush()
+    # Requests are served concurrently, newest-wins: each arrival bumps `gen`,
+    # which every older worker polls between stream chunks and bails on (the
+    # editor's abort-and-refire — Cursor's cancelCpp). Without this the loop is
+    # serial, and during a typing burst every reply describes a buffer two
+    # keystrokes old: the client bins it as stale and the user sees nothing.
+    wlock = threading.Lock()
+    latest = {"gen": 0}
+
+    def emit(obj):
+        with wlock:
+            sys.stdout.write(json.dumps(obj) + "\n")
+            sys.stdout.flush()
+
+    def serve(req, my_gen):
+        rid = req.get("id")
+
+        def cancelled():
+            return latest["gen"] != my_gen
+
+        try:
+            res = complete(req, cancelled)
+        except Exception as e:
+            # a stream torn down mid-abort raises; that's a cancel, not an error
+            if cancelled():
+                emit({"id": rid, "aborted": True})
+            else:
+                emit({"id": rid, "error": str(e)})
+            return
+        if res is None or cancelled():
+            emit({"id": rid, "aborted": True})
+        else:
+            res["id"] = rid
+            emit(res)
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
-        rid = None
         try:
             req = json.loads(line)
-            rid = req.get("id")
-            res = complete(req)
-            res["id"] = rid
         except Exception as e:
-            res = {"id": rid, "error": str(e)}
-        sys.stdout.write(json.dumps(res) + "\n")
-        sys.stdout.flush()
+            emit({"id": None, "error": str(e)})
+            continue
+        latest["gen"] += 1
+        threading.Thread(target=serve, args=(req, latest["gen"]), daemon=True).start()
 
 
 if __name__ == "__main__":

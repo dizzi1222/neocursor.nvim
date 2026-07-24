@@ -18,6 +18,7 @@ local state = {
   cfg = nil,
   seen = nil,     -- { buf, tick, row, col } last observed state; our own edits' echoes match it
   req = nil,      -- { bufnr, tick } buffer identity+version of the in-flight request
+  req_ticks = {}, -- [id] = { bufnr, tick } per request, for rescuing late replies
   queue = nil,     -- { list = {edit,...}, idx } multi-edit chain from one response
   prediction = nil, -- { path, line } next-jump target (cursorPredictionTarget)
   pred_rejects = {}, -- [path:line] = {count, ts} — Cursor: 30s TTL, max 5, mute at 2
@@ -405,7 +406,11 @@ local function result_summary(res)
 end
 
 local function handle_result(res)
-  state.awaiting = false -- a reply landed (fresh or stale); the flight is over
+  if res.id == state.seq then state.awaiting = false end -- the current flight resolved
+  if res.aborted then -- superseded upstream by a newer request; expected churn
+    log("ABORT   #" .. tostring(res.id) .. "  (superseded)")
+    return
+  end
   if res.error then
     state.last_error = res.error
     log("ERR     #" .. tostring(res.id) .. "  " .. tostring(res.error))
@@ -416,6 +421,23 @@ local function handle_result(res)
   end
   state.last_ok_at = os.time()
   if res.id ~= state.seq then
+    -- The reply outlived its request — but if the buffer is still byte-for-byte
+    -- the one it was computed against (only movement-triggered refires bumped
+    -- seq since), it is exact for this buffer. Binning it here is how good
+    -- edits used to vanish while empty-handed newer replies showed "NOOP".
+    local rt = state.req_ticks[res.id]
+    local cb = vim.api.nvim_get_current_buf()
+    if rt and res.edits and #res.edits > 0 and rt.bufnr == cb
+      and vim.api.nvim_buf_get_changedtick(cb) == rt.tick then
+      log(("RESCUE  #%s  (late, buffer unchanged)  %s"):format(tostring(res.id), result_summary(res)))
+      vim.schedule(function()
+        if vim.api.nvim_get_current_buf() == cb
+          and vim.api.nvim_buf_get_changedtick(cb) == rt.tick then
+          render_result(res)
+        end
+      end)
+      return
+    end
     log(("RES     #%s  (stale, seq=%d)  %s"):format(tostring(res.id), state.seq, result_summary(res)))
     return
   end
@@ -637,6 +659,8 @@ local function send_request()
   local lint = collect_linter_errors(bufnr, rp)
   local fdh = collect_file_diff_histories(bufnr, rp)
   state.req = { bufnr = bufnr, tick = vim.api.nvim_buf_get_changedtick(bufnr) }
+  state.req_ticks[state.seq] = state.req
+  state.req_ticks[state.seq - 16] = nil -- keep the ledger bounded
   local req = {
     id = state.seq,
     path = path,

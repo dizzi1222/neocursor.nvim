@@ -603,7 +603,12 @@ local function buf_diff(buf)
   if not b then return nil end
   local cur = buf_text(buf)
   if cur == b.text then return nil end
-  local d = vim.diff(b.text .. "\n", cur .. "\n", { result_type = "unified", ctxlen = 3 })
+  -- ctxlen=0: emit ONLY the changed lines, no surrounding context. Cursor's
+  -- backend uses diffHistory to locate the in-progress edit; 3 lines of context
+  -- (the old default) bury the change and make it mis-locate — on a real file
+  -- that silently flips the reply to edits=0. Verified against the live backend:
+  -- same request, ctxlen=3 → 0 edits, ctxlen=0 → the correct completion.
+  local d = vim.diff(b.text .. "\n", cur .. "\n", { result_type = "unified", ctxlen = 0 })
   if type(d) ~= "string" or d == "" then return nil end
   return cap(d, DIFF_CAP), cur
 end

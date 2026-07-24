@@ -306,6 +306,9 @@ def main():
 
     def serve(req, my_gen):
         rid = req.get("id")
+        if os.environ.get("NC_DUMP"):  # debug: tee each incoming request
+            with open(os.environ["NC_DUMP"], "a") as fh:
+                fh.write(json.dumps(req) + "\n")
 
         def cancelled():
             return latest["gen"] != my_gen

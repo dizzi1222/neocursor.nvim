@@ -7,16 +7,14 @@ into Cursor, there is nothing else to set up — neocursor drives Cursor's own
 `StreamCpp` backend with your existing login, so you get the *same* predictions,
 at the *same* latency, as Cursor itself.
 
-```
-        you type…                    …Cursor predicts your next edit
-  ┌────────────────────┐            ┌────────────────────────────────────────┐
-  │ def quicksort(arr): │           │ def quicksort(arr):                     │
-  │     if len(arr)█     │  ── Tab → │     if len(arr) <= 1:                   │
-  │                      │           │         return arr                      │
-  │                      │           │     pivot = arr[len(arr) // 2]      ░░░ │
-  └────────────────────┘            └────────────────────────────────────────┘
-                                       ghost text · Tab accepts · Tab again jumps
-```
+<p align="center">
+  <img src="./assets/demo.png" alt="neocursor.nvim: Cursor's Tab predicting the rest of is_prime() as ghost text in Neovim" width="800">
+</p>
+
+<p align="center">
+  <sub>Typed <code>def is_prime(n):</code> — Cursor predicted the whole body.
+  <code>&lt;Tab&gt;</code> accepts · <code>&lt;Tab&gt;</code> again jumps to the next edit.</sub>
+</p>
 
 > ⚠️ **Beta.** The goal is 1:1 parity with Cursor's Tab. We're most of the way
 > there — see [parity](#cursor-tab-parity) for exactly what's ported and what isn't.

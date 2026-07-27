@@ -52,6 +52,45 @@ That's the whole list — **there is no additional configuration:**
 No tokens, no `setup()` arguments required. Open a file, start typing, pause →
 ghost text → `<Tab>`.
 
+**vim.pack** (built into Neovim ≥ 0.12) — the minimal setup:
+
+```lua
+vim.pack.add { "https://github.com/teocns/neocursor.nvim" }
+require("neocursor").setup {}
+```
+
+<details>
+<summary>vim.pack: full parity with the lazy.nvim spec (pre-warm + lazy start)</summary>
+
+The lazy.nvim spec above pre-warms the sidecar's Python deps at install time
+(`build`) and defers startup to insert mode (`event`). The vim.pack equivalent:
+
+```lua
+-- pre-warm the sidecar's deps on install/update (lazy.nvim's `build`).
+-- Register this BEFORE vim.pack.add so it sees the initial install.
+vim.api.nvim_create_autocmd("PackChanged", {
+  callback = function(ev)
+    if ev.data.spec.name ~= "neocursor.nvim" then return end
+    if ev.data.kind == "install" or ev.data.kind == "update" then
+      vim.system { "uv", "run", "--with", "httpx[http2]", "python", "-c", "import httpx" }
+    end
+  end,
+})
+
+vim.pack.add { "https://github.com/teocns/neocursor.nvim" }
+
+-- start on first insert (lazy.nvim's `event = "InsertEnter"`)
+vim.api.nvim_create_autocmd("InsertEnter", {
+  once = true,
+  callback = function() require("neocursor").setup {} end,
+})
+```
+
+Skipping the pre-warm is fine — the sidecar fetches its own deps on first
+launch; the first suggestion just arrives a few seconds later.
+
+</details>
+
 <details>
 <summary>Letting nvim-cmp / blink.cmp own <code>&lt;Tab&gt;</code></summary>
 
@@ -73,6 +112,13 @@ if require("neocursor").accept() then return end
 
 ```lua
 { "teocns/neocursor.nvim", version = "*" } -- latest tagged release instead of main
+```
+
+With vim.pack, `version` takes a tag, branch, commit hash, or
+`vim.version.range()`:
+
+```lua
+vim.pack.add { { src = "https://github.com/teocns/neocursor.nvim", version = vim.version.range "*" } }
 ```
 
 </details>

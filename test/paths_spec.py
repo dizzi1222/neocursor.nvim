@@ -40,9 +40,23 @@ def plant(root: Path) -> Path:
 def env(**over):
     """Clean slate for every var the resolver reads, plus the case's overrides."""
     base = dict(os.environ)
-    for k in ("CURSOR_CONFIG_DIR", "CURSOR_STATE_DB_PATH", "XDG_CONFIG_HOME", "APPDATA"):
+    for k in (
+        "CURSOR_CONFIG_DIR",
+        "CURSOR_STATE_DB_PATH",
+        "XDG_CONFIG_HOME",
+        "APPDATA",
+        "HOMEDRIVE",
+        "HOMEPATH",
+    ):
         base.pop(k, None)
-    base.update({k: str(v) for k, v in over.items()})
+    over = {k: str(v) for k, v in over.items()}
+    # expanduser("~") reads HOME on POSIX but USERPROFILE on Windows, where HOME
+    # is ignored outright. A case that sets only HOME therefore tests the
+    # runner's real home dir on a Windows host — which is how this spec passed
+    # locally and failed in CI. Set both.
+    if "HOME" in over:
+        over.setdefault("USERPROFILE", over["HOME"])
+    base.update(over)
     return mock.patch.dict(os.environ, base, clear=True)
 
 

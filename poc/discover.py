@@ -3,10 +3,12 @@
 import os, json, base64, time, sqlite3, struct, sys
 import httpx
 
-SUP = os.path.expanduser("~/Library/Application Support/Cursor")
+# poc/ sits one level below the repo root; put it on sys.path for cursor_paths.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import cursor_paths
 
 def read_token():
-    con = sqlite3.connect(f"file:{SUP}/User/globalStorage/state.vscdb?mode=ro", uri=True)
+    con = sqlite3.connect(cursor_paths.state_db_uri(), uri=True)
     row = con.execute("SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken'").fetchone()
     con.close(); return row[0]
 
@@ -30,7 +32,7 @@ def deframe(buf):
         yield flag, buf[i:i+ln]; i+=ln
 
 tok = read_token()
-sj = json.load(open(f"{SUP}/User/globalStorage/storage.json"))
+sj = json.load(open(cursor_paths.storage_json(), encoding="utf-8"))
 mid, mac = sj["telemetry.machineId"], sj["telemetry.macMachineId"]
 H = {
     "authorization": f"Bearer {tok}",

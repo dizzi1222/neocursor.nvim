@@ -31,8 +31,28 @@ That's the whole list — **there is no additional configuration:**
 - **[`uv`](https://github.com/astral-sh/uv)** on your `PATH` (the Python sidecar
   runs via `uv`; it fetches its own deps on first run — nothing to `pip install`).
 
-> Currently macOS only — the sidecar reads Cursor's token from the macOS app
-> path. Linux/Windows paths are on the [roadmap](#cursor-tab-parity).
+**macOS, Linux and Windows.** The sidecar finds Cursor's signed-in session
+wherever your platform puts it:
+
+| | Cursor data dir |
+|---|---|
+| macOS | `~/Library/Application Support/Cursor` |
+| Linux | `$XDG_CONFIG_HOME/Cursor` → `~/.config/Cursor` |
+| Windows | `%APPDATA%\Cursor` |
+
+Insiders builds and the lowercase `cursor` directory some Linux packages create
+are detected too. If your install lives somewhere else — a portable copy, a
+Flatpak/Snap sandbox, or Windows-side Cursor seen from WSL — point the sidecar
+at it:
+
+```sh
+export CURSOR_CONFIG_DIR="/mnt/c/Users/me/AppData/Roaming/Cursor"   # WSL example
+# or aim straight at the SQLite file:
+export CURSOR_STATE_DB_PATH="/path/to/User/globalStorage/state.vscdb"
+```
+
+Not sure what it's resolving? `uv run cursor_paths.py` in the plugin directory
+prints every path it checks — paste that into a bug report.
 
 ---
 
@@ -44,7 +64,8 @@ That's the whole list — **there is no additional configuration:**
 {
   "teocns/neocursor.nvim",
   event = "InsertEnter",
-  build = "uv run --with 'httpx[http2]' python -c 'import httpx'", -- pre-warm the sidecar
+  -- pre-warm the sidecar (double quotes so cmd.exe and sh both parse it)
+  build = 'uv run --with "httpx[http2]" python -c "import httpx"',
   opts = {},
 }
 ```
@@ -143,7 +164,7 @@ scoreboard — what actually made it across, and what's still in flight:
 | Config pulled live from Cursor (`CppConfig`: debounce, heuristics) | ✅ |
 | Character-level diffs for single-character edits | 🚧 |
 | Cross-file *apply* on jump targets | 🚧 partial — jump lands, chain is partial |
-| Linux / Windows auth paths | 🚧 macOS only |
+| macOS / Linux / Windows auth paths | ✅ |
 
 <sub>✅ ported · 🚧 in progress</sub>
 

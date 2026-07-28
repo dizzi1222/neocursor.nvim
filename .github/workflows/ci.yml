@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push: # every branch: platform bugs should surface before a PR exists
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  platforms:
+    # The point of the matrix: neocursor reads Cursor's session off disk, and
+    # that path moves per OS. Nobody is signed into Cursor on a runner, so the
+    # specs synthesize an install (test/fake_cursor_home.py) — enough to prove
+    # resolution, the SQLite URI, LF framing and the jobstart plumbing. The live
+    # backend is out of scope here: it's httpx over TLS, not platform-specific.
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false # nothing to key a cache on: no uv.lock, deps come from --with
+
+      - uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: stable
+
+      - name: path resolution (all three platform layouts, faked)
+        run: python test/paths_spec.py
+
+      - name: sidecar startup contract (real sidecar, synthesized install)
+        run: python test/handshake_spec.py
+
+      - name: headless tab-flow spec (canned sidecar, real jobstart plumbing)
+        run: nvim --headless -u NONE -c "luafile test/flow_spec.lua"

@@ -23,7 +23,8 @@ local nc = require("neocursor")
 nc.stop()
 nc.setup({
   debounce = 30,
-  sidecar_cmd = { "python3", root .. "/test/fake_sidecar.py" },
+  -- "python3" doesn't exist on Windows; the canned sidecar is stdlib-only
+  sidecar_cmd = { vim.fn.executable("python3") == 1 and "python3" or "python", root .. "/test/fake_sidecar.py" },
   map_tab = false, -- as in the user's config: blink's chain owns <Tab>
 })
 

@@ -32,6 +32,7 @@ local state = {
   log_buf = nil,
   log_dirty = false,
   awaiting = false, -- a request is in flight (sent, no reply yet) — dashboard phase
+  stderr_tail = {}, -- last stderr lines, replayed if the sidecar dies before ready
 }
 
 local function plugin_root()
@@ -464,6 +465,7 @@ local function on_stdout(_, data)
   data[1] = state.partial .. (data[1] or "")
   state.partial = table.remove(data) or ""
   for _, l in ipairs(data) do
+    l = l:gsub("\r$", "") -- Windows: jobstart splits on \n and leaves the \r
     if l ~= "" then handle_line(l) end
   end
 end
@@ -471,8 +473,18 @@ end
 local function on_stderr(_, data)
   if not data then return end
   for _, l in ipairs(data) do
+    l = l:gsub("\r$", "")
     if l ~= "" then
-      if l:find("ready") then state.ready = true; log("SIDECAR ready") else state.last_stderr = l; log("SIDECAR " .. l) end
+      if l:find("ready") then
+        state.ready = true; log("SIDECAR ready")
+      else
+        state.last_stderr = l
+        -- Keep a short tail: the sidecar's fatal errors (no Cursor install, not
+        -- signed in) are multi-line, and they're all a user gets to debug with.
+        table.insert(state.stderr_tail, l)
+        if #state.stderr_tail > 20 then table.remove(state.stderr_tail, 1) end
+        log("SIDECAR " .. l)
+      end
     end
   end
 end
@@ -481,10 +493,23 @@ function M.start()
   if state.job then return end
   local cmd = vim.deepcopy(state.cfg.sidecar_cmd)
   table.insert(cmd, plugin_root() .. "/sidecar.py")
+  state.stderr_tail = {}
   local job = vim.fn.jobstart(cmd, {
     on_stdout = on_stdout,
     on_stderr = on_stderr,
-    on_exit = function() state.job = nil; state.ready = false; state.awaiting = false; log("SIDECAR exited") end,
+    on_exit = function()
+      local never_ready = not state.ready
+      state.job = nil; state.ready = false; state.awaiting = false
+      log("SIDECAR exited")
+      -- Died during startup: say why instead of going quietly inert.
+      if never_ready then
+        local why = table.concat(state.stderr_tail, "\n")
+        vim.notify(
+          "neocursor: sidecar exited during startup" .. (why ~= "" and ("\n" .. why) or ""),
+          vim.log.levels.ERROR
+        )
+      end
+    end,
   })
   if job <= 0 then
     vim.notify("neocursor: failed to launch sidecar", vim.log.levels.ERROR)

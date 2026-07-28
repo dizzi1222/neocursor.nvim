@@ -17,8 +17,18 @@ line/col in the request are 0-indexed (neovim). range in the reply is
 
 Launch:  uv run --with 'httpx[http2]' sidecar.py
 """
-import os, sys, json, base64, time, sqlite3, struct, socket, subprocess, threading
+import io, os, sys, json, base64, time, sqlite3, struct, socket, subprocess, threading
 import httpx
+import cursor_paths
+
+# Pin the stdio codec instead of inheriting the platform's: Windows text mode
+# would rewrite our "\n" record separator to "\r\n" (the client frames replies
+# on LF), and a POSIX C locale would give us ASCII, mangling any non-ASCII
+# buffer content on the way through.
+sys.stdout = io.TextIOWrapper(
+    sys.stdout.buffer, encoding="utf-8", newline="\n", line_buffering=True
+)
+sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8")
 
 # --- resolver resilience -----------------------------------------------------
 # macOS mDNSResponder occasionally negative-caches a CNAME hop (Cursor's hosts
@@ -53,22 +63,28 @@ def _getaddrinfo(host, port, *a, **kw):
         return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, int(port or 0)))]
 
 
-socket.getaddrinfo = _getaddrinfo
+if sys.platform == "darwin":  # the bug is mDNSResponder's; elsewhere getaddrinfo is fine
+    socket.getaddrinfo = _getaddrinfo
 # -----------------------------------------------------------------------------
 
-SUP = os.path.expanduser("~/Library/Application Support/Cursor")
-GS  = f"{SUP}/User/globalStorage"
+# The signed-in session lives in Cursor's user-data dir, which moves per
+# platform (macOS Application Support / Linux XDG / Windows APPDATA) —
+# cursor_paths resolves it.
 URL = "https://api2.cursor.sh/aiserver.v1.AiService/StreamCpp"
 
 
 def read_token() -> str:
-    con = sqlite3.connect(f"file:{GS}/state.vscdb?mode=ro", uri=True)
+    if not cursor_paths.state_db().is_file():
+        raise RuntimeError(cursor_paths.not_found_message())
+    con = sqlite3.connect(cursor_paths.state_db_uri(), uri=True)
     row = con.execute(
         "SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken'"
     ).fetchone()
     con.close()
     if not row:
-        raise RuntimeError("no cursorAuth/accessToken — is Cursor signed in?")
+        raise RuntimeError(
+            f"no cursorAuth/accessToken in {cursor_paths.state_db()} — is Cursor signed in?"
+        )
     return row[0]
 
 
@@ -89,9 +105,31 @@ def frame(b: bytes) -> bytes:
     return b"\x00" + struct.pack(">I", len(b)) + b
 
 
-TOK = read_token()
-_sj = json.load(open(f"{GS}/storage.json"))
-MID, MAC = _sj["telemetry.machineId"], _sj["telemetry.macMachineId"]
+def read_session():
+    """Token + machine ids from the local Cursor install."""
+    tok = read_token()
+    sj_path = cursor_paths.storage_json()
+    try:
+        with open(sj_path, encoding="utf-8") as fh:
+            sj = json.load(fh)
+    except OSError as e:
+        raise RuntimeError(f"cannot read {sj_path}: {e}")
+    mid = sj.get("telemetry.machineId")
+    if not mid:
+        raise RuntimeError(f"no telemetry.machineId in {sj_path} — launch Cursor once")
+    # macMachineId is MAC-address-derived, not macOS-specific: VS Code (and so
+    # Cursor) writes it everywhere. Fall back to machineId if it's missing.
+    return tok, mid, sj.get("telemetry.macMachineId") or mid
+
+
+try:
+    TOK, MID, MAC = read_session()
+except Exception as e:
+    # The common first-run failure is "Cursor isn't where we looked", and a
+    # traceback buries it. The client replays these lines verbatim in :messages.
+    sys.stderr.write(f"neocursor sidecar: {e}\n")
+    sys.stderr.flush()
+    raise SystemExit(1)
 CLIENT = httpx.Client(http2=True, timeout=30)
 HEADERS = {
     "x-cursor-client-version": "1.1.3",

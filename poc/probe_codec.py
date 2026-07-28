@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Probe AiService with correct Connect codecs. Unary=raw body; streaming=enveloped."""
-import os, json, base64, time, sqlite3, struct
+import os, json, base64, time, sqlite3, struct, sys
 import httpx
 
-SUP = os.path.expanduser("~/Library/Application Support/Cursor")
+# poc/ sits one level below the repo root; put it on sys.path for cursor_paths.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import cursor_paths
 def read_token():
-    con = sqlite3.connect(f"file:{SUP}/User/globalStorage/state.vscdb?mode=ro", uri=True)
+    con = sqlite3.connect(cursor_paths.state_db_uri(), uri=True)
     v = con.execute("SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken'").fetchone()[0]
     con.close(); return v
 def alf(b):
@@ -17,7 +19,7 @@ def checksum(mid,mac):
     return base64.b64encode(alf(ts.to_bytes(6,"big"))).decode()+f"{mid}/{mac}"
 
 tok=read_token()
-sj=json.load(open(f"{SUP}/User/globalStorage/storage.json"))
+sj=json.load(open(cursor_paths.storage_json(), encoding="utf-8"))
 mid,mac=sj["telemetry.machineId"],sj["telemetry.macMachineId"]
 base={"authorization":f"Bearer {tok}","x-cursor-checksum":checksum(mid,mac),
       "x-cursor-client-version":"1.1.3","x-cursor-client-type":"ide","connect-protocol-version":"1"}

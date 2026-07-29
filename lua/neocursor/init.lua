@@ -35,6 +35,25 @@ local state = {
   stderr_tail = {}, -- last stderr lines, replayed if the sidecar dies before ready
 }
 
+-- Hint chrome — the ⟪neocursor · <Tab> …⟫ label on an edit and the ⟪<Tab> → L42⟫
+-- pill at a jump target — is display-only. Hiding it changes what you see, never
+-- what <Tab> does, so every gate below still fires exactly as it did.
+local HINTS_ALL = { edit = true, prediction = true }
+
+--- show_hints: true/nil = all, false = none, table = per-surface.
+local function normalize_hints(v)
+  if v == false then return { edit = false, prediction = false } end
+  if type(v) == "table" then
+    return { edit = v.edit ~= false, prediction = v.prediction ~= false }
+  end
+  return { edit = true, prediction = true }
+end
+
+-- state.cfg is nil until setup() runs; default to showing everything.
+local function hints()
+  return (state.cfg and state.cfg.show_hints) or HINTS_ALL
+end
+
 local function plugin_root()
   local src = debug.getinfo(1, "S").source:sub(2)
   return vim.fn.fnamemodify(src, ":h:h:h") -- .../lua/neocursor/init.lua -> root
@@ -230,7 +249,8 @@ local function show_edit(edit)
     preview.inline(bufnr, row1 - 1, col0, ghost)
   else
     local at = cursor_at(start0, end0_excl)
-    preview.diff(bufnr, start0, cur_range, lines, at and "<Tab> accept" or "<Tab> jump")
+    local label = hints().edit and (at and "<Tab> accept" or "<Tab> jump") or nil
+    preview.diff(bufnr, start0, cur_range, lines, label)
   end
   log(("SHOW    %-6s L%d  (%d ln)"):format(mode, start0 + 1, #lines))
   return true
@@ -318,15 +338,19 @@ local function show_prediction()
   if not (p and p.line) then return false end
   local bufnr = vim.api.nvim_get_current_buf()
   local rel = buf_relpath(bufnr)
+  -- painting is optional (show_hints); the jump target itself is not, so the
+  -- true/false this returns must stay the same either way
+  local paint = hints().prediction
+  if not paint then preview.clear_prediction(bufnr) end
   if (not p.path) or p.path == rel then
     local lc = vim.api.nvim_buf_line_count(bufnr)
     local row1 = math.min(math.max(p.line, 1), lc)
     if row1 == vim.api.nvim_win_get_cursor(0)[1] then return false end
-    preview.prediction(bufnr, row1 - 1, "<Tab> → L" .. row1)
+    if paint then preview.prediction(bufnr, row1 - 1, "<Tab> → L" .. row1) end
   else
     -- cross-file target: anchor the hint at the cursor, name the destination
     local cur0 = vim.api.nvim_win_get_cursor(0)[1] - 1
-    preview.prediction(bufnr, cur0, ("<Tab> → %s:%d"):format(p.path, p.line))
+    if paint then preview.prediction(bufnr, cur0, ("<Tab> → %s:%d"):format(p.path, p.line)) end
   end
   log(("PRED    → %s:%d"):format(p.path or "·", p.line))
   return true
@@ -971,6 +995,9 @@ function M.accept_partial()
 end
 function M.has_prediction() return state.prediction ~= nil end
 
+-- exposed for test/hints_spec.lua; pure, no state
+M._normalize_hints = normalize_hints
+
 function M.dismiss()
   local s = state.suggestion
   if s then
@@ -1028,6 +1055,7 @@ function M.setup(opts)
     sidecar_cmd = opts.sidecar_cmd or { "uv", "run", "--with", "httpx[http2]" },
     map_tab = opts.map_tab ~= false, -- set false when another plugin (cmp) owns <Tab>
     filetypes = opts.filetypes,      -- optional allow-list; nil = all normal buffers
+    show_hints = normalize_hints(opts.show_hints), -- display-only chrome; see normalize_hints
     exclude_patterns = {},           -- filled from CppConfig (skip .env/.pem/... as context)
     heuristics = {},                 -- filled from CppConfig (active suppression rules)
     reject_hard = 2,
@@ -1151,6 +1179,7 @@ function M.setup(opts)
       "chain       : " .. (state.queue and (state.queue.idx .. "/" .. #state.queue.list) or "none"),
       "config      : debounce=" .. state.cfg.debounce .. "ms  heuristics=" .. #state.cfg.heuristics
         .. "  excludes=" .. #state.cfg.exclude_patterns,
+      "hints       : edit=" .. tostring(hints().edit) .. "  prediction=" .. tostring(hints().prediction),
       "last suppress: " .. tostring(state.last_suppressed or "none"),
       "buffer      : buftype='" .. vim.bo.buftype .. "'  filetype='" .. vim.bo.filetype .. "'",
       "attach ok   : " .. tostring(should_attach(vim.api.nvim_get_current_buf())),

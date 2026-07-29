@@ -44,3 +44,11 @@ jobs:
 
       - name: headless tab-flow spec (canned sidecar, real jobstart plumbing)
         run: nvim --headless -u NONE -c "luafile test/flow_spec.lua"
+
+      - name: hint chrome spec (show_hints rendering + normalization)
+        run: nvim --headless -u NONE -c "luafile test/hints_spec.lua"
+
+      - name: tab-flow spec with hints off (chrome must not change behavior)
+        env:
+          NEOCURSOR_SPEC_NO_HINTS: "1"
+        run: nvim --headless -u NONE -c "luafile test/flow_spec.lua"

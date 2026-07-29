@@ -199,8 +199,28 @@ require("neocursor").setup({
   map_tab     = true,         -- false → another plugin owns <Tab>
   map_partial = "<M-Right>",  -- word-by-word accept
   filetypes   = nil,          -- allow-list, e.g. { "python", "lua" }; nil = all
+  show_hints  = true,         -- false → no hint chrome (see below)
 })
 ```
+
+**`show_hints`** controls the two labels neocursor paints. Suggestions themselves
+are never affected — the ghost text, the diff, and every `<Tab>` behavior are
+identical either way.
+
+| Surface | Looks like | What it marks |
+|---|---|---|
+| `edit` | `⟪neocursor · <Tab> accept⟫` | a pending edit; the diff beside it already shows the change |
+| `prediction` | `⟪<Tab> → L42⟫` | a jump target — the *only* on-screen sign one is queued |
+
+```lua
+show_hints = false                                 -- hide both
+show_hints = { edit = false }                      -- hide the label, keep the jump pill
+show_hints = { prediction = false }                -- hide the pill, keep the label
+```
+
+Turning the prediction pill off makes pending jumps invisible: `<Tab>` still
+jumps, you just won't see where until it does. `:NeocursorDebug` prints the
+resolved setting.
 
 </details>
 

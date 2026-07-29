@@ -20,6 +20,10 @@ function M.namespace()
   return ns
 end
 
+function M.prediction_namespace()
+  return ns_pred
+end
+
 function M.clear(bufnr)
   -- diff mode paints many extmarks, so clear the whole namespace, not one id
   pcall(vim.api.nvim_buf_clear_namespace, bufnr or 0, ns, 0, -1)
@@ -78,6 +82,7 @@ end
 
 --- Diff overlay for edits that replace existing lines (overrides / rewrites).
 --- old_lines = current content of [start0, start0+#old_lines); new_lines = suggestion.
+--- hint = label for the discoverability pill, or nil to omit it (show_hints).
 function M.diff(bufnr, start0, old_lines, new_lines, hint)
   M.clear(bufnr)
   local hunks = vim.diff(
@@ -128,12 +133,15 @@ function M.diff(bufnr, start0, old_lines, new_lines, hint)
     end
   end
 
-  -- discoverability hint on the region's first line ("jump" vs "accept")
-  local hint_line = math.max(0, math.min(start0, nbuf - 1))
-  vim.api.nvim_buf_set_extmark(bufnr, ns, hint_line, 0, {
-    virt_text = { { "  ⟪neocursor · " .. (hint or "<Tab> accept") .. "⟫", HINT_HL } },
-    virt_text_pos = "eol",
-  })
+  -- discoverability hint on the region's first line ("jump" vs "accept").
+  -- nil when hints are off: the diff itself already shows what the edit does.
+  if hint then
+    local hint_line = math.max(0, math.min(start0, nbuf - 1))
+    vim.api.nvim_buf_set_extmark(bufnr, ns, hint_line, 0, {
+      virt_text = { { "  ⟪neocursor · " .. hint .. "⟫", HINT_HL } },
+      virt_text_pos = "eol",
+    })
+  end
 end
 
 return M

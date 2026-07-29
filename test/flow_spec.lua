@@ -22,8 +22,14 @@ local function check(desc, got, want)
 end
 
 local nc = require("neocursor")
+-- NEOCURSOR_SPEC_NO_HINTS=1 reruns this whole spec with the hint chrome off.
+-- Hiding hints is display-only, so every behavioral assertion below — jump,
+-- accept, chain advance — must hold identically in both modes.
+local no_hints = os.getenv("NEOCURSOR_SPEC_NO_HINTS") == "1"
+io.stdout:write(no_hints and "-- show_hints = false --\n" or "-- show_hints = default --\n")
 nc.setup({
   debounce = 30,
+  show_hints = not no_hints,
   -- "python3" doesn't exist on Windows; the canned sidecar is stdlib-only
   sidecar_cmd = { vim.fn.executable("python3") == 1 and "python3" or "python", root .. "/test/fake_sidecar.py" },
 })

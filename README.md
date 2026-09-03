@@ -11,12 +11,18 @@
     <img src="https://img.shields.io/github/v/release/teocns/neocursor.nvim?color=blue&label=release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/Neovim-0.10%2B-57A143?logo=neovim&logoColor=white" alt="Neovim 0.10+">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="macOS, Linux, Windows">
-  <a href="./LICENSE">
+  <a align="center" href="./LICENSE">
     <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT"></a>
 </p>
 
 <p align="center">
   <img src="./assets/demo.gif" alt="neocursor.nvim in Neovim: renaming self.retries to self.max_retries, then pressing Tab to jump to each stale call site and accept the rewritten line" width="800">
+</p>
+
+<p align="center">
+<a href="https://github.com/dizzi1222/nvim">
+  <img src="https://github.com/user-attachments/assets/43998c73-c698-40a8-857a-8b6bae37ed27" alt="Best Nvim Config" width="890">
+</a>
 </p>
 
 <p align="center">

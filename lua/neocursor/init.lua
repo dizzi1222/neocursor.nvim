@@ -1283,7 +1283,8 @@ vim.api.nvim_create_autocmd("ModeChanged", {
   vim.keymap.set("i", "<C-]>", M.dismiss, { desc = "neocursor: dismiss" })
   -- [dizzi patch] allow dismissing the ghost also from normal mode (NES mode)
   vim.keymap.set("n", "<Esc>", M.dismiss, { desc = "neocursor: dismiss (normal)" })
-  vim.keymap.set("v", "<Esc>", M.dismiss, { desc = "neocursor: dismiss (visual)" })
+  -- 󰚌 NO MAPEES EN VISUAL: Cursor's visual mode is a special case, and we don'tneed it 󰚌 :
+  -- vim.keymap.set("v", "<Esc>", M.dismiss, { desc = "neocursor: dismiss (visual)" })
   vim.api.nvim_create_user_command("NeocursorSuggest", M.suggest, { desc = "request a suggestion now" })
   vim.api.nvim_create_user_command("NeocursorLog", M.log, { desc = "toggle the neocursor live log pane" })
 

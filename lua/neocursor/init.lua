@@ -438,13 +438,11 @@ local function render_result(res)
     log("DROP    stale response (buffer changed since request)")
     return
   end
-  -- the request went out in insert mode, but the reply is landing now — if
-  -- the user has since left insert there is nothing here that can act on it,
-  -- and the next InsertEnter asks afresh anyway
-  if not inserting() then
-    log(("DROP    reply landed outside insert (mode=%s)"):format(vim.api.nvim_get_mode().mode))
-    return
-  end
+  -- [dizzi patch] disabled: allow rendering predictions in normal mode too.
+  -- if not inserting() then
+  --   log(("DROP    reply landed outside insert (mode=%s)"):format(vim.api.nvim_get_mode().mode))
+  --   return
+  -- end
   -- adopt this response's prediction target (or drop a stale/muted one)
   preview.clear_prediction(bufnr)
   local pred = res.prediction

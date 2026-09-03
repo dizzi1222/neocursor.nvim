@@ -121,14 +121,14 @@ function M.diff(bufnr, start0, old_lines, new_lines, hint)
       if ca > 0 then
         anchor, above = start0 + (sa - 1) + (ca - 1), false -- below last deleted line
       elseif sa == 0 then
-        anchor, above = start0, true -- pure insert before region start
+        anchor, above = start0, false -- [dizzi patch] below, not above
       else
         anchor, above = start0 + (sa - 1), false -- pure insert after line sa
       end
       anchor = math.max(0, math.min(anchor, nbuf - 1))
       vim.api.nvim_buf_set_extmark(bufnr, ns, anchor, 0, {
         virt_lines = vlines,
-        virt_lines_above = above,
+        virt_lines_above = false, -- [dizzi patch] always below
       })
     end
   end

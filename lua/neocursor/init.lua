@@ -1227,15 +1227,24 @@ function M.setup(opts)
   -- from normal_check, still before any other key is read. The pattern admits
   -- every insert/replace variant as the old mode; the callback then ignores
   -- hops that stay inside insert (i → ic while a completion menu is up, and back).
-  vim.api.nvim_create_autocmd("ModeChanged", {
-    group = grp,
-    pattern = "[iR]*:*",
-    callback = function(args)
-      local new_mode = vim.v.event.new_mode
-      if new_mode:match("^[iR]") then return end
-      on_leave(args.buf, new_mode:match("^ni") and "detour" or "dismiss")
-    end,
-  })
+vim.api.nvim_create_autocmd("ModeChanged", {
+  group = grp,
+  pattern = "[iR]*:*",
+  callback = function(args)
+    local old_mode = vim.v.event.old_mode
+    local new_mode = vim.v.event.new_mode
+    -- [dizzi patch] Prevent auto-dismiss when leaving insert mode
+    -- to allow predictions to persist in normal mode (NES style)
+    if old_mode:match("^[iR]") and not new_mode:match("^[iR]") then
+      -- Leaving insert/replace mode: do not dismiss automatically
+      -- User can dismiss with <Esc> in normal mode
+      return
+    end
+    -- Original behavior for other mode changes
+    if new_mode:match("^[iR]") then return end
+    on_leave(args.buf, new_mode:match("^ni") and "detour" or "dismiss")
+  end,
+})
   vim.api.nvim_create_autocmd("BufLeave", {
     group = grp,
     callback = function(args) on_leave(args.buf, "buffer") end,

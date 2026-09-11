@@ -227,6 +227,14 @@ local function apply_config(cfg)
   end
   if type(cfg.heuristics) == "table" then
     state.cfg.heuristics = cfg.heuristics
+    if state.cfg.keep_suggesting_after_reject then
+      state.cfg.heuristics = vim.tbl_filter(
+        function(n)
+          return n ~= "HEURISTIC_SUGGESTING_RECENTLY_REJECTED_EDIT"
+        end,
+        state.cfg.heuristics
+      )
+    end
   end
   if type(cfg.reject_hard) == "number" then
     state.cfg.reject_hard = cfg.reject_hard
@@ -1393,6 +1401,7 @@ function M.setup(opts)
     heuristics = {}, -- filled from CppConfig (active suppression rules)
     reject_hard = 2,
     max_cleared = 20, -- CppConfig maxNumberOfClearedSuggestionsSinceLastAccept
+    keep_suggesting_after_reject = opts.keep_suggesting_after_reject == true,
     is_fused = nil, -- CppConfig isFusedCursorPredictionModel (nil = unknown)
     map_partial = opts.map_partial ~= false
         and (type(opts.map_partial) == "string" and opts.map_partial or "<M-Right>")

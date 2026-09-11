@@ -23,6 +23,7 @@ local state = {
   last_line = nil, -- last cursor row seen, to detect line changes (Cursor's lastLine)
   queue = nil, -- { list = {edit,...}, idx } multi-edit chain from one response
   prediction = nil, -- { path, line } next-jump target (cursorPredictionTarget)
+  jumped = false, -- the last <Tab> was a JUMP onto the current suggestion: the next <Tab> accepts without trusting cursor_at
   pred_rejects = {}, -- [path:line] = {count, ts} — Cursor: 30s TTL, max 5, mute at 2
   viewed = {}, -- [bufnr] = ms of last BufEnter (recency for additionalFiles)
   dbase = {}, -- [bufnr] = { path, text } baseline snapshot for diffing
@@ -70,6 +71,7 @@ local function clear_suggestion()
     state.suggestion = nil
   end
   state.queue = nil -- abandon any pending multi-edit chain
+  state.jumped = false -- a fresh suggestion starts with the cursor-at decision again
 end
 
 local function buf_relpath(b)
@@ -1116,6 +1118,7 @@ local function do_accept(s)
   end
   preview.clear(s.bufnr)
   state.suggestion = nil
+  state.jumped = false -- a real accept is never a follow-up to a jump
   cancel_timer() -- a request scheduled before the accept would race the chain
   vim.cmd("let &g:undolevels=&g:undolevels") -- one undo reverts the whole accept
   local lc = vim.api.nvim_buf_line_count(s.bufnr)
@@ -1220,6 +1223,16 @@ function M.accept()
       clear_suggestion() -- suggestion belongs to another buffer; Tab stays a tab
       return false
     end
+    -- A previous <Tab> already jumped onto this suggestion, so accept now
+    -- without the cursor test: chain jumps in normal mode get their cursor
+    -- reverted by expr-mapping evaluation in some setups, making cursor_at
+    -- unreliable (the "JUMP forever" loop). This latch is deterministic.
+    if state.jumped then
+      state.jumped = false
+      log("ACCEPT  L" .. (s.start0 + 1))
+      run_or_defer(do_accept, s)
+      return true
+    end
     if cursor_at(s.start0, s.end0_excl) then
       if tab_should_indent(s) then
         return false
@@ -1228,6 +1241,7 @@ function M.accept()
       run_or_defer(do_accept, s)
     else
       log("JUMP    L" .. (s.start0 + 1))
+      state.jumped = true
       run_or_defer(do_jump, s)
     end
     return true
@@ -1265,6 +1279,7 @@ local function do_accept_partial(s)
   local frag = ghost:match("^\n%s*") or ghost:match("^%s*[^%s]+") or ghost
   local flines = vim.split(frag, "\n", { plain = true })
   vim.api.nvim_buf_set_text(bufnr, row1 - 1, col0, row1 - 1, col0, flines)
+  state.jumped = false
   local nrow1 = row1 + #flines - 1
   local ncol = #flines > 1 and #flines[#flines] or (col0 + #frag)
   pcall(vim.api.nvim_win_set_cursor, 0, { nrow1, ncol })

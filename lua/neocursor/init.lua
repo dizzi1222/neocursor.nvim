@@ -531,6 +531,17 @@ local function render_result(res)
     log("DROP    stale response (buffer changed since request)")
     return
   end
+  -- [dizzi patch] Also drop when the cursor moved since the request. A jump moves
+  -- the cursor without changing changedtick, so the range above would still pass;
+  -- applying this reply then would reset the accept/jump chain (state.queue.idx)
+  -- and break the jump→accept flow. Ranges were computed for the old position.
+  if rq and rq.row then
+    local c = vim.api.nvim_win_get_cursor(0)
+    if rq.row ~= c[1] or rq.col ~= c[2] then
+      log("DROP    stale response (cursor moved since request)")
+      return
+    end
+  end
   -- [dizzi patch] disabled: allow rendering predictions in normal mode too.
   -- if not inserting() then
   --   log(("DROP    reply landed outside insert (mode=%s)"):format(vim.api.nvim_get_mode().mode))
@@ -968,7 +979,7 @@ local function send_request()
   local adds = collect_additional_files(bufnr)
   local lint = collect_linter_errors(bufnr, rp)
   local fdh = collect_file_diff_histories(bufnr, rp)
-  state.req = { bufnr = bufnr, tick = vim.api.nvim_buf_get_changedtick(bufnr) }
+  state.req = { bufnr = bufnr, tick = vim.api.nvim_buf_get_changedtick(bufnr), row = cur[1], col = cur[2] }
   state.req_ticks[state.seq] = state.req
   state.req_ticks[state.seq - 16] = nil -- keep the ledger bounded
   local req = {

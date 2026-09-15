@@ -157,7 +157,8 @@ local function log_refresh()
     )
   end
 
-  local sidecar = state.ready and "● ready" or (state.job and "◐ starting" or "○ down")
+  local sidecar = (state.ready and "● ready" or (state.job and "◐ starting" or "○ down"))
+    .. " · " .. (c.host or "cursor")
   local sugg = s and ("%s L%d · %d ln"):format(s.mode, s.start0 + 1, #s.lines) or "none"
   local chain = state.queue and (state.queue.idx .. "/" .. #state.queue.list) or "—"
   local seen = state.seen and ("L%d:%d ↻%s"):format(state.seen.row, state.seen.col, tostring(state.seen.tick))
@@ -741,7 +742,18 @@ function M.start()
     return
   end
   local cmd = vim.deepcopy(state.cfg.sidecar_cmd)
-  table.insert(cmd, plugin_root() .. "/sidecar.py")
+  local sidecar_script = "sidecar.py" -- host default/fallback
+  if state.cfg.host == "antigravity" then
+    local root = plugin_root()
+    if vim.fn.filereadable(root .. "/sidecar_antigravity.py") == 1 then
+      sidecar_script = "sidecar_antigravity.py"
+    elseif vim.fn.filereadable(root .. "/sidecar_agy.py") == 1 then
+      sidecar_script = "sidecar_agy.py"
+    else
+      log("WARN    host=antigravity pero sin sidecar → usando cursor (sidecar.py)")
+    end
+  end
+  table.insert(cmd, plugin_root() .. "/" .. sidecar_script)
   state.stderr_tail = {}
   local job = vim.fn.jobstart(cmd, {
     on_stdout = on_stdout,
@@ -768,7 +780,7 @@ function M.start()
     return
   end
   state.job = job
-  log("SIDECAR launching")
+  log(("SIDECAR launching (host=%s)"):format(state.cfg.host))
 end
 
 -- Gather the proximity context Cursor's native Tab sends as `additionalFiles`:
@@ -1393,6 +1405,11 @@ function M.setup(opts)
   opts = opts or {}
   state.cfg = {
     debounce = opts.debounce or 250,
+    -- [dizzi] host del cursortab: "cursor" (default) o "antigravity" (ruta B:
+    -- IDE de Antigravity como fuente). El motor Lua es neutral al host: mismo
+    -- protocolo stdio {edits, prediction}. Si el sidecar de antigravity no está
+    -- disponible, caemos a sidecar.py para no dejar el cursortab muerto.
+    host = opts.host == "antigravity" and "antigravity" or "cursor",
     sidecar_cmd = opts.sidecar_cmd or { "uv", "run", "--with", "httpx[http2]" },
     map_tab = opts.map_tab ~= false, -- set false when another plugin (cmp) owns <Tab>
     filetypes = opts.filetypes, -- optional allow-list; nil = all normal buffers
@@ -1585,7 +1602,9 @@ vim.api.nvim_create_autocmd("ModeChanged", {
       "requests    : seq=" .. tostring(state.seq) .. "  last_ok=" .. tostring(state.last_ok_at or "never"),
       "suggestion  : " .. (s and (s.mode .. "  lines=" .. #s.lines) or "none"),
       "chain       : " .. (state.queue and (state.queue.idx .. "/" .. #state.queue.list) or "none"),
-      "config      : debounce="
+      "config      : host="
+        .. (state.cfg.host or "cursor")
+        .. "  debounce="
         .. state.cfg.debounce
         .. "ms  heuristics="
         .. #state.cfg.heuristics

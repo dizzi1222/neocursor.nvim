@@ -34,8 +34,7 @@ TOKFILE = os.path.expanduser("~/.config/nvim/antigravity_token")
 PROJECT = "aicode-consumers"
 MODEL_TAB = "tab_flash_lite_preview"
 WINDOW = int(os.environ.get("ANTY_WINDOW", "25"))  # líneas de contexto alrededor del cursor
-GHOST_MAX_LINES = int(os.environ.get("ANTY_GHOST_MAX", "3"))
-GHOST_MAX_CHARS = int(os.environ.get("ANTY_GHOST_MAX_CHARS", "200"))
+GHOST_MAX_LINES = int(os.environ.get("ANTY_GHOST_MAX", "6"))
 
 
 def refresh_bearer():
@@ -124,18 +123,8 @@ def strip_fences(text):
     return text.strip()
 
 
-_TOPLEVEL = re.compile(r"^(export|import|function|class|interface|type|const|let|var|enum|namespace|pub|fn|def)\b")
-_ESCAPE = re.compile(r'\\[nrtu0]|\\"|\\\\')
-
-
 def extract_ghost(content, line, col, resp):
-    """Ghost inline SOLO si es limpio y local. '' (NOOP) si:
-      - el response trae escapes literales (\\n, \\", \\t, \\u…) → string JSON,
-      - no se puede anclar el prefix del cursor,
-      - excede GHOST_MAX_CHARS o GHOST_MAX_LINES,
-      - quier echar el archivo original / declaraciones top-level nuevas."""
-    if _ESCAPE.search(resp):
-        return ""
+    """Solo textto que continúa justo después del cursor. '' si no se puede anclar."""
     olines = content.split("\n")
     prefix = olines[min(line, len(olines) - 1)][:col]
     if not prefix:
@@ -157,9 +146,7 @@ def extract_ghost(content, line, col, resp):
         if nj.startswith("```"):
             break
         if on < len(olines) and nj == olines[on]:
-            break  # re-echo del archivo original → cortar
-        if _TOPLEVEL.match(nj.lstrip()):
-            break  # nueva declaración top-level → cortar (no incluirla)
+            break  # está re-echando el archivo original → cortar
         added.append(nj)
         j += 1
         on += 1
@@ -167,8 +154,6 @@ def extract_ghost(content, line, col, resp):
             break
     ghost_lines = ([tail] if tail else []) + added
     ghost = "\n".join(ghost_lines).strip()
-    if not ghost or len(ghost) > GHOST_MAX_CHARS:
-        return ""
     return ghost
 
 

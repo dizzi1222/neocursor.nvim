@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """sidecar_antigravity.py — host=antigravity del cursortab (Ruta B).
 
-El supercomplete de Antigravity es una LLM COMPLETION directa (descubierto por
-MITM del LS) en:
+El supercomplete de Antigravity es una LLM COMPLETION directa en:
   POST https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse
-  Auth: Bearer OAuth (refrescable via ~/.config/nvim/anty_oauth.json).
-  Body: {"project":..., "request": {"contents":[{"role":"user","parts":[{"text":
-        <archivo con <|cursor|>>}]}], "generationConfig":...}, "model":"tab_flash_lite_preview",
-        "userAgent":"antigravity","requestType":"tab"}
-  Respuesta SSE -> candidates[].content.parts[].text (continuación o archivo propuesto).
+  Auth: Bearer OAuth (refrescable via ~/.config/nvim/anty_oauth.json o token capturado).
+  Modelo: tab_flash_lite_preview ('completion', no 'prediction').
 
-PROTOCOLO NEUTRO = sidecar.py (stdio JSON-lines {id,path,content,line,col} -> {id,edits,text,range}).
+POLÍTICA ANTI-BASURA (aprendida en pruebas):
+  - Si se le manda el archivo ENTERO devuelve la solución completa reescrita
+    (diffts gigantes que reemplazan/cuelgan el archivo). Por eso:
+      1) se envía una VENTANA local alrededor del cursor (±WINDOW líneas),
+      2) la línea del cursor se TRUNCA en la columna (clásico "completá desde acá"),
+      3) del response SOLO se extrae el texto continuado justo después del cursor
+         (ghost inline), descartando todo lo demás; si no se puede anclar → NOOP.
+  Resultado: el Tab sugiere sólo la continuación local. NUNCA ediciones masivas.
+
+PROTOCOLO NEUTRO (igual que sidecar.py): stdio JSON-lines.
+  in : {"id","path","content","line","col","language"}
+  out: {"id","text","range","edits","prediction"}   (edits máx. 1, ghost)
+       {"id","error"}  /  {"config": {...}} al boot
 """
 import json
 import os
 import re
 import sys
-import difflib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,7 +33,8 @@ OAUTH = os.path.expanduser("~/.config/nvim/anty_oauth.json")
 TOKFILE = os.path.expanduser("~/.config/nvim/antigravity_token")
 PROJECT = "aicode-consumers"
 MODEL_TAB = "tab_flash_lite_preview"
-MODEL_TAB_JUMP = "tab_jump_flash_lite_preview"
+WINDOW = int(os.environ.get("ANTY_WINDOW", "25"))  # líneas de contexto alrededor del cursor
+GHOST_MAX_LINES = int(os.environ.get("ANTY_GHOST_MAX", "6"))
 
 
 def refresh_bearer():
@@ -54,22 +62,25 @@ def refresh_bearer():
     return None
 
 
-def mark_cursor(content, line, col):
+def local_window(content, line, col):
+    """Slice cursor±WINDOW, línea del cursor TRUNCADA en col + marca."""
     lines = content.split("\n")
-    row = max(0, min(line, len(lines) - 1))
-    ln = lines[row] if row < len(lines) else ""
-    cn = max(0, min(col, len(ln)))
-    lines[row] = ln[:cn] + "<|cursor|>" + ln[cn:]
-    return "\n".join(lines)
+    lo = max(0, line - WINDOW)
+    hi = min(len(lines), line + WINDOW + 1)
+    win = lines[lo:hi]
+    row = line - lo  # fila del cursor dentro de la ventana
+    cur = win[row]
+    win[row] = cur[:col] + "<|cursor|>"
+    return "\n".join(win)
 
 
-def tab_req(content, line, col, kind="tab"):
+def tab_req(content, line, col):
     payload = {
         "project": PROJECT,
-        "requestId": f"neocursor/{kind}/" + os.urandom(8).hex(),
+        "requestId": "neocursor/tab/" + os.urandom(8).hex(),
         "request": {
-            "contents": [{"role": "user", "parts": [{"text": mark_cursor(content, line, col)}]}],
-            "generationConfig": {"maxOutputTokens": 1500},
+            "contents": [{"role": "user", "parts": [{"text": local_window(content, line, col)}]}],
+            "generationConfig": {"maxOutputTokens": 400},
         },
         "model": MODEL_TAB,
         "userAgent": "antigravity",
@@ -86,12 +97,12 @@ def call_tab(payload, bearer):
                                  data=json.dumps(payload).encode(), headers=h, method="POST")
     raw = urllib.request.urlopen(req, timeout=90).read().decode("utf-8", "replace")
     parts = []
-    for line in raw.split("\n"):
-        line = line.strip()
-        if not line.startswith("data:"):
+    for ln in raw.split("\n"):
+        ln = ln.strip()
+        if not ln.startswith("data:"):
             continue
         try:
-            j = json.loads(line[5:].strip())
+            j = json.loads(ln[5:].strip())
             for c in j.get("response", {}).get("candidates", []):
                 for p in c.get("content", {}).get("parts", []):
                     parts.append(p.get("text") or "")
@@ -101,37 +112,54 @@ def call_tab(payload, bearer):
 
 
 def strip_fences(text):
+    text = text.replace("<|cursor|>", "")
     if text.startswith("```"):
         lines = text.split("\n")
         if lines and lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines and lines[-1].startswith("```"):
             lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    return text
+        text = "\n".join(lines)
+    return text.strip()
 
 
-def neutral_edits(original, produced):
-    a = original.split("\n")
-    b = (produced or "").split("\n")
-    edits = []
-    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            continue
-        text = "\n".join(b[j1:j2])
-        if tag == "insert":
-            edits.append({"text": text, "range": {"start": i1 + 1, "endInclusive": i1}})
-        else:
-            edits.append({"text": text, "range": {"start": i1 + 1, "endInclusive": i2}})
-    return edits
+def extract_ghost(content, line, col, resp):
+    """Solo textto que continúa justo después del cursor. '' si no se puede anclar."""
+    olines = content.split("\n")
+    prefix = olines[min(line, len(olines) - 1)][:col]
+    if not prefix:
+        return ""
+    rlines = resp.split("\n")
+    idx = None
+    for i, rl in enumerate(rlines):
+        if rl.startswith(prefix):
+            idx = i
+            break
+    if idx is None:
+        return ""
+    tail = rlines[idx][len(prefix):]
+    added = []
+    on = min(line + 1, len(olines) - 1)
+    j = idx + 1
+    while j < len(rlines):
+        nj = rlines[j]
+        if nj.startswith("```"):
+            break
+        if on < len(olines) and nj == olines[on]:
+            break  # está re-echando el archivo original → cortar
+        added.append(nj)
+        j += 1
+        on += 1
+        if len(added) >= GHOST_MAX_LINES:
+            break
+    ghost_lines = ([tail] if tail else []) + added
+    ghost = "\n".join(ghost_lines).strip()
+    return ghost
 
 
 def serve():
     sys.stderr.write("neocursor sidecar (host=antigravity) ready\n")
     sys.stderr.flush()
-    # Handshake de config PROACTIVO (igual que sidecar.py): el engine no lo
-    # pide, lo recibe al boot. Heuristics vacías → motor con defaults sanos.
     sys.stdout.write(json.dumps({
         "config": {"debounce": 250, "exclude_patterns": [], "heuristics": [],
                    "reject_hard": 2, "max_cleared": 20, "is_fused": True}}) + "\n")
@@ -146,19 +174,17 @@ def serve():
             continue
         rid = req.get("id")
         if req.get("config") is not None:
-            sys.stdout.write(json.dumps({
-                "config": {"debounce": 250, "exclude_patterns": [], "heuristics": [],
-                           "reject_hard": 2, "max_cleared": 20, "is_fused": True}}) + "\n")
-            sys.stdout.flush()
-            continue
+            continue  # config ya se envió proactivo
         bearer = refresh_bearer()
         if not bearer:
             sys.stdout.write(json.dumps({"id": rid, "error": "token faltante (capture_anty_token.sh o anty_oauth.json)"}) + "\n")
             sys.stdout.flush()
             continue
         content = req.get("content") or ""
+        row0 = req.get("line") or 0
+        col0 = req.get("col") or 0
         try:
-            payload = tab_req(content, req.get("line") or 0, req.get("col") or 0)
+            payload = tab_req(content, row0, col0)
             text = call_tab(payload, bearer)
         except urllib.error.HTTPError as e:
             sys.stdout.write(json.dumps({"id": rid, "error": f"HTTP {e.code} {e.read().decode('utf-8','replace')[:200]}"}) + "\n")
@@ -169,19 +195,17 @@ def serve():
             sys.stdout.flush()
             continue
         stripped = strip_fences(text)
-        if not stripped:
+        ghost = extract_ghost(content, row0, col0, stripped)
+        if not ghost:
             sys.stdout.write(json.dumps({"id": rid, "text": "", "range": None, "edits": [], "prediction": None}) + "\n")
             sys.stdout.flush()
             continue
-        # Ghost (continuación en cursor) vs edición por diff del archivo completo
-        edits = neutral_edits(content, stripped)
-        if not edits:
-            row1 = (req.get("line") or 0) + 1
-            edits = [{"text": stripped, "range": {"start": row1, "endInclusive": row1}}]
-        first = edits[0]
-        sys.stdout.write(json.dumps({"id": rid, "text": first["text"], "range": first["range"],
-                                     "edits": edits, "prediction": None}) + "\n")
+        row1 = row0 + 1  # 1-indexed inclusive start/end para insertar en la fila del cursor
+        edit = {"text": ghost, "range": {"start": row1, "endInclusive": row0}}
+        sys.stdout.write(json.dumps({"id": rid, "text": ghost, "range": edit["range"],
+                                     "edits": [edit], "prediction": None}) + "\n")
         sys.stdout.flush()
 
 
-serve()
+if __name__ == "__main__":
+    serve()

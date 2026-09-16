@@ -742,18 +742,39 @@ function M.start()
     return
   end
   local cmd = vim.deepcopy(state.cfg.sidecar_cmd)
-  local sidecar_script = "sidecar.py" -- host default/fallback
+  -- sidecar del HOST. El fallback SIEMPRE es la ruta absoluta de sidecar.py
+  -- (evita buscarlo relativo al cwd).
+  local sidecar_path = plugin_root() .. "/sidecar.py"
   if state.cfg.host == "antigravity" then
-    local root = plugin_root()
-    if vim.fn.filereadable(root .. "/sidecar_antigravity.py") == 1 then
-      sidecar_script = "sidecar_antigravity.py"
-    elseif vim.fn.filereadable(root .. "/sidecar_agy.py") == 1 then
-      sidecar_script = "sidecar_agy.py"
+    local candidates = {
+      plugin_root() .. "/sidecar_antigravity.py",
+      os.getenv("HOME") .. "/workspace/neocursor.nvim/sidecar_antigravity.py",
+      plugin_root() .. "/sidecar_agy.py", -- legacy del approach CLI (ya no se usa)
+    }
+    local found = nil
+    for _, p in ipairs(candidates) do
+      if vim.fn.filereadable(p) == 1 then
+        found = p
+        break
+      end
+    end
+    if found then
+      -- Fallback por CAPACIDAD: sin token OAuth de Antigravity el sidecar no
+      -- sirve; mejor dejar el Tab a Cursor (sidecar.py) si existe la app.
+      local oauth = vim.fn.stdpath("config") .. "/anty_oauth.json"
+      local tok = vim.fn.stdpath("config") .. "/antigravity_token"
+      local has_token = vim.fn.filereadable(oauth) == 1 or vim.fn.filereadable(tok) == 1
+      if has_token then
+        sidecar_path = found
+        log("SIDECAR host=" .. state.cfg.host .. " using " .. vim.fn.fnamemodify(found, ":t"))
+      else
+        log("WARN    host=antigravity sin token OAuth en " .. oauth .. " → usando cursor (sidecar.py)")
+      end
     else
-      log("WARN    host=antigravity pero sin sidecar → usando cursor (sidecar.py)")
+      log("WARN    host=antigravity sin sidecar → usando cursor (sidecar.py)")
     end
   end
-  table.insert(cmd, plugin_root() .. "/" .. sidecar_script)
+  table.insert(cmd, sidecar_path)
   state.stderr_tail = {}
   local job = vim.fn.jobstart(cmd, {
     on_stdout = on_stdout,

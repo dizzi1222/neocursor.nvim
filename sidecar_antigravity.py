@@ -39,8 +39,8 @@ PROJECT = "aicode-consumers"
 MODEL_TAB = "tab_flash_lite_preview"
 SESSION_ID = os.environ.get("ANTY_SESSION", "-3750763034362895579")
 WINDOW = int(os.environ.get("ANTY_WINDOW", "25"))
-GHOST_MAX_LINES = int(os.environ.get("ANTY_GHOST_MAX", "3"))
-GHOST_MAX_CHARS = int(os.environ.get("ANTY_GHOST_MAX_CHARS", "200"))
+GHOST_MAX_LINES = int(os.environ.get("ANTY_GHOST_MAX", "6"))
+GHOST_MAX_CHARS = int(os.environ.get("ANTY_GHOST_MAX_CHARS", "400"))
 _HAS_TOKEN_OVERRIDE = bool(os.environ.get("ANTY_TOKEN"))
 
 _TOPLEVEL = re.compile(r"^(export|import|function|class|interface|type|const|let|var|enum|namespace|pub|fn|def)\b")
@@ -255,6 +255,24 @@ def one_edit(buffer_lines, s1, e1, tgt, rep):
     return {"text": rep, "range": {"start": s1, "endInclusive": e1}}
 
 
+def is_duplicate_block(buffer_lines, s1, e1, lines):
+    """True si `lines` (≥1) ya aparece completo y contiguo en el buffer FUERA
+    del rango [s1,e1]. Ataca el caso 'el modelo re-propone el bloque que el
+    usuario ya escribió' (pisa código reciente, lo duplica arriba/abajo)."""
+    if not lines or not lines[0].strip():
+        return False
+    n = len(lines)
+    text = lines[:n]
+    for i, ln in enumerate(buffer_lines):
+        if s1 - 1 <= i <= e1 - 1:
+            continue
+        if i + n > len(buffer_lines):
+            break
+        if buffer_lines[i : i + n] == text:
+            return True
+    return False
+
+
 def function_call_edits(buffer_lines, name, args):
     edits = []
     try:
@@ -341,6 +359,10 @@ def strip_fences(text):
     m = re.search(r'(?:"\n"){2,}', text)
     if m:
         text = text[: m.start()]
+    # residuo de tool-call JSON a medio emitir: comilla + newline + tab (}"\n\t*}]
+    m = re.search(r'["\']\n\t', text)
+    if m and m.start() > 0:
+        text = text[: m.start()]
     text = re.sub(r"[\"']\s*\n\t*[}\]]\s*$", "", text)
     # cola JSON huérfana: comilla solitaria al final (artefacto del escape)
     text = re.sub(r'["\']\s*$', "", text)
@@ -423,7 +445,10 @@ def serve():
     sys.stderr.write("neocursor sidecar (host=antigravity) ready\n")
     sys.stderr.flush()
     sys.stdout.write(json.dumps({
-        "config": {"debounce": 400, "exclude_patterns": [], "heuristics": [],
+        "config": {"debounce": 400, "exclude_patterns": [], "heuristics": [
+            "HEURISTIC_DUPLICATING_LINE_AFTER_SUGGESTION",
+            "HEURISTIC_REVERTING_USER_CHANGE",
+        ],
                    "reject_hard": 2, "max_cleared": 20, "is_fused": True}}) + "\n")
     sys.stdout.flush()
     for ln in sys.stdin:
@@ -487,6 +512,13 @@ def serve():
         if edits:
             # cap defensivo: ≤6 edits, cada reemplazo ≤40 líneas
             edits = [e for e in edits if (e["range"]["endInclusive"] - e["range"]["start"] + 1) <= 40][:6]
+            # filtro anti-duplicado: descartar edits que repiten un bloque existente
+            edits = [
+                e for e in edits
+                if not is_duplicate_block(
+                    buffer_lines, e["range"]["start"], e["range"]["endInclusive"],
+                    e["text"].split("\n"))
+            ]
         if edits:
             first = edits[0]
             sys.stdout.write(json.dumps({"id": rid, "text": first["text"], "range": first["range"],
@@ -496,6 +528,8 @@ def serve():
         # fallback ghost
         stripped = strip_fences(text)
         ghost = extract_ghost(content, row0, col0, stripped)
+        if ghost and is_duplicate_block(buffer_lines, row0 + 1, row0, ghost.split("\n")):
+            ghost = ""
         if not ghost:
             sys.stdout.write(json.dumps({"id": rid, "text": "", "range": None, "edits": [], "prediction": None}) + "\n")
             sys.stdout.flush()

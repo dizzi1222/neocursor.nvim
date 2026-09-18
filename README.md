@@ -245,6 +245,12 @@ touches the network — that boundary is deliberate.
 > + anchor de coherencia gold↔buffer) y el "siguiente edit" se ubica con difflib
 > en su posición real para el salto `Tab`→jump. Ediciones de alto alcance o
 > refactors cross-buffer no se esperan de este modelo.
+>
+> **Confirmado por captura real (ANTY_DUMP, 2026-09-18):** el sidecar habla con
+> `model=tab_flash_lite_preview`, `requestType=tab` y la respuesta del servidor
+> reporta el mismo `modelVersion` — es el mismo motor que el Supercomplete del
+> IDE. El modelo responde **file-wide FIM**: replica el archivo completo con el
+> edit en `<|cursor|>` (ver "Anti-truncamiento FIM" abajo).
 
 **Parámetros del sidecar Antigravity** (env, defaults):
 

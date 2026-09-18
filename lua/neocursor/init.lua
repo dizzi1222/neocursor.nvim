@@ -749,8 +749,8 @@ function M.start()
   local sidecar_path = plugin_root() .. "/sidecar.py"
   if state.cfg.host == "antigravity" then
     local candidates = {
-      plugin_root() .. "/sidecar_antigravity.py",
       os.getenv("HOME") .. "/workspace/neocursor.nvim/sidecar_antigravity.py",
+      plugin_root() .. "/sidecar_antigravity.py",
       plugin_root() .. "/sidecar_agy.py", -- legacy del approach CLI (ya no se usa)
     }
     local found = nil

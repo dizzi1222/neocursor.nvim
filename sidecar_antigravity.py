@@ -386,8 +386,8 @@ def diff_edits(content, line, resp):
     sm = difflib.SequenceMatcher(None, olines, rlines, autojunk=False)
     equal_n = sum((j2 - j1) for op, i1, i2, j1, j2 in sm.get_opcodes() if op == "equal")
     min_n = min(len(olines), len(rlines))
-    # si el gold replica <40% de las líneas, está inventando otro archivo
-    if min_n and (equal_n / min_n) < 0.40:
+    # si el gold replica <60% de las líneas, está inventando otro archivo
+    if min_n and (equal_n / min_n) < 0.60:
         return []
 
     edits = []
@@ -440,7 +440,14 @@ def extract_ghost(content, line, col, resp):
     # el bug que insertaba basura de otra parte del archivo.
     cands = [i for i, rl in enumerate(rlines) if rl.startswith(prefix)]
     if not cands:
-        # continuación pura: el modelo no replicó el buffer, respondió solo el tail
+        # continuación pura: tail corto (≤5 ln) sin top-level/import → no es
+        # otro archivo. Un gold de otro buffer (React, etc.) arranca con
+        # import/export/top-level → descartar.
+        if len(rlines) > GHOST_MAX_LINES + 2:
+            return ""
+        first = rlines[0].strip() if rlines else ""
+        if not first or first.startswith("import") or _TOPLEVEL.match(first):
+            return ""
         ghost = "\n".join(rlines).strip()
         if not ghost or len(ghost) > GHOST_MAX_CHARS:
             return ""
@@ -450,22 +457,27 @@ def extract_ghost(content, line, col, resp):
     GHOST_NEAR = int(os.environ.get("ANTY_GHOST_NEAR", "6"))
 
     def anchor_ok(idx):
-        # K líneas antes del candidato deben coincidir con el buffer previo al
-        # cursor (coherencia: el gold está replicando ESTA zona, no otra).
+        # ≥2 líneas antes del candidato deben coincidir con el buffer previo al
+        # cursor (coherencia: gold replicando ESTA zona). En las primeras 2
+        # líneas (sin 2 previas), basta 1 coincidencia.
+        need = 1 if line < 2 else 2
         k = 0
-        while k < 2 and line - 1 - k >= 0 and idx - 1 - k >= 0 and olines[line - 1 - k] == rlines[idx - 1 - k]:
+        while k < need and line - 1 - k >= 0 and idx - 1 - k >= 0 and olines[line - 1 - k] == rlines[idx - 1 - k]:
             k += 1
-        return k > 0
+        return k >= need
 
     def score(idx):
         dist = abs(idx - min(line, len(rlines) - 1))
         return dist
 
     anchored = [i for i in cands if anchor_ok(i)]
-    # máx-ALCANCE: priorizar candidato con anchor válido; si ninguno tiene,
-    # aceptar el más cercano al cursor (no romper si el gold difiere 1 línea).
-    pool = anchored if anchored else cands
-    idx = min(pool, key=score)
+    # fiabilidad TOTAL: solo candidatos con anchor — si el gold no replica
+    # coherentemente la zona del cursor (otro archivo, otro bloque), no sugerir.
+    # (La opción "max" aceptaba el más cercano sin anchor y permitía golds
+    # incoherentes que rompían el buffer — confirmado en vivo.)
+    if not anchored:
+        return ""
+    idx = min(anchored, key=score)
 
     tail = rlines[idx][len(prefix):]
     added = []

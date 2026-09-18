@@ -51,6 +51,11 @@ MAX_REPLACE_CURSOR_DIST = int(os.environ.get("ANTY_MAX_CURSOR_DIST", "5"))
 GHOST_MAX_LINES = int(os.environ.get("ANTY_GHOST_MAX", "3"))
 GHOST_MAX_CHARS = int(os.environ.get("ANTY_GHOST_MAX_CHARS", "400"))
 GHOST_NEAR = int(os.environ.get("ANTY_GHOST_NEAR", "6"))
+# Dump de depuración (sin proxy/MITM): si ANTY_DUMP apunta a una ruta, cada
+# request del tab (payload + respuesta SSE cruda) se appenda en JSON-lines.
+# Sirve para capturar el request REAL sobre un archivo concreto desde el
+# sidecar de nvim, sin relanzar el IDE ni tocar su tráfico.
+ANTY_DUMP = os.environ.get("ANTY_DUMP") or ""
 
 _TOPLEVEL = re.compile(r"^(export|import|function|class|interface|type|const|let|var|enum|namespace|pub|fn|def)\b")
 _ESCAPE = re.compile(r'\\[nrtu0]|\\"|\\\\')
@@ -243,7 +248,7 @@ def tab_req(content, line, col, path=""):
                 }],
             },
             "sessionId": SESSION_ID,
-            "generationConfig": {"maxOutputTokens": 256,
+            "generationConfig": {"maxOutputTokens": 1024,
                                  "thinkingConfig": {"includeThoughts": False}},
         },
         "model": MODEL_TAB,
@@ -260,11 +265,18 @@ def call_tab(payload, bearer):
         "Accept": "text/event-stream",
         "User-Agent": "antigravity/2.1.1 linux/amd64 google-api-nodejs-client/10.3.0",
     }
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(
         BASE + "/v1internal:streamGenerateContent?alt=sse",
-        data=json.dumps(payload).encode(), headers=h, method="POST",
+        data=body, headers=h, method="POST",
     )
     raw = urllib.request.urlopen(req, timeout=90).read().decode("utf-8", "replace")
+    if ANTY_DUMP:
+        try:
+            with open(ANTY_DUMP, "a") as fh:  # sin bearer; JSON-lines
+                fh.write(json.dumps({"request": payload, "response": raw}) + "\n")
+        except Exception:
+            pass
     calls, texts = [], []
     for ln in raw.split("\n"):
         ln = ln.strip()
@@ -502,6 +514,16 @@ def diff_edits(content, line, resp):
             continue
         if (j2 - j1) > GHOST_MAX_LINES + 2:
             continue
+        # TRUNCAMIENTO FIM (observado en el oráculo real): el modelo replica el
+        # archivo completo pero maxOutputTokens corta la salida a mitad (hasta
+        # en medio de una línea). El gold NO contiene el final del buffer →
+        # difflib ve un "replace" del resto (ej. [L38-51]) que NO es edición sino
+        # un corte de tokens. Detectarlo: si el texto del gold es PREFIJO exacto
+        # del texto del buffer en ese rango (el modelo solo replicó el inicio y
+        # se quedó corto), no hay edición → descartar y dejar que el ghost
+        # extraiga la continuación real tras <|cursor|>.
+        if i2 == len(olines) and new and "".join(new).startswith("".join(old[:len(new)])):
+            return []
         # el rango emitido usa el lado VIEJO del buffer; si el gold "omitió"
         # una zona entera, i2-i1 explota (ej. [L27-226]) → cap al rango emitido
         if (i2 - i1 + 1) > MAX_REPLACE_LINES:

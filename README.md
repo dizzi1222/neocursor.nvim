@@ -263,6 +263,7 @@ touches the network — that boundary is deliberate.
 | `ANTY_GHOST_MAX_CHARS` | `400` | Máx. chars del ghost |
 | `ANTY_GHOST_NEAR` | `6` | Ventana de cercanía del ghost |
 | `ANTY_SESSION` | fijo | sessionId usado en el payload |
+| `ANTY_DUMP` | *(vacío)* | Ruta de depuración: cada request del tab (payload + respuesta SSE cruda, sin Bearer) se appenda en JSON-lines. Útil para capturar el oráculo real sobre un archivo concreto sin proxy/MITM |
 
 **Escalado de contexto (file-wide):**
 
@@ -276,6 +277,14 @@ touches the network — that boundary is deliberate.
 > firmas (`export`, `function`, `class`, …) con su línea `L42 programs = {`.
 > Le da al modelo visión file-wide sin el costo de mandar el archivo completo
 > por keystroke — el mecanismo que reemplaza la proximidad como factor.
+
+**Anti-truncamiento FIM** (verificado contra capturas reales): el modelo replica
+el archivo completo (FIM), pero si `maxOutputTokens` (1024) se queda corto, el
+gold sale cortado a mitad y `diff_edits` interpreta el final del buffer como
+"borrado" (los `[L27-226]` históricos). El sidecar detecta el patrón — el texto
+del gold es prefijo exacto del buffer en ese rango → no es edición, es corte de
+tokens → descarta el diff y deja que el ghost extraiga la continuación real
+tras `<|cursor|>`.
 
 El lenguaje del archivo se anuncia al modelo vía `lang_for_path()` (extensión →
 `TypeScript`, `Python`, `Rust`, …) para orientar mejor que un rol genérico.

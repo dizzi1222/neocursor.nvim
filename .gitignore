@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 *.swp
 .DS_Store
+tests/fixtures/connects_*.log

@@ -25,7 +25,9 @@ PROTOCOLO NEUTRO (igual que sidecar.py): stdio JSON-lines.
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -355,6 +357,35 @@ def extract_ghost(content, line, col, resp):
 
 
 # ----------------------------------------------------------------------------
+_last_refresh_attempt = {"at": 0.0}
+REFRESH_COOLDOWN_S = 120  # ≥2 min entre recapturas automáticas
+
+
+def auto_refresh_token():
+    """Re-captura el Bearer corriendo capture_anty_token.sh (MITM 1-shot)."""
+    now = time.time()
+    if now - _last_refresh_attempt["at"] < REFRESH_COOLDOWN_S:
+        return None
+    _last_refresh_attempt["at"] = now
+    script = os.path.expanduser("~/.config/nvim/capture_anty_token.sh")
+    if not os.path.isfile(script):
+        return None
+    try:
+        subprocess.run([script], timeout=150, capture_output=True)
+    except Exception:
+        return None
+    if os.path.isfile(TOKFILE):
+        try:
+            t = open(TOKFILE).read().strip().replace("Bearer ", "")
+            if t.startswith("ya29"):
+                sys.stderr.write("neocursor: token re-capturado automáticamente\n")
+                sys.stderr.flush()
+                return t
+        except Exception:
+            pass
+    return None
+
+
 def serve():
     sys.stderr.write("neocursor sidecar (host=antigravity) ready\n")
     sys.stderr.flush()
@@ -385,9 +416,30 @@ def serve():
             payload = tab_req(content, row0, col0)
             calls, text = call_tab(payload, bearer)
         except urllib.error.HTTPError as e:
-            sys.stdout.write(json.dumps({"id": rid, "error": f"HTTP {e.code}"}) + "\n")
-            sys.stdout.flush()
-            continue
+            if e.code == 401:
+                # token vencido/invalidado → re-captura automática + 1 reintento
+                new_tok = auto_refresh_token()
+                if new_tok:
+                    try:
+                        payload = tab_req(content, row0, col0)
+                        calls, text = call_tab(payload, new_tok)
+                        bearer = new_tok
+                    except urllib.error.HTTPError as e2:
+                        sys.stdout.write(json.dumps({"id": rid, "error": f"HTTP {e2.code} (post-refresh)"}) + "\n")
+                        sys.stdout.flush()
+                        continue
+                    except Exception as ex:
+                        sys.stdout.write(json.dumps({"id": rid, "error": str(ex)[:200]}) + "\n")
+                        sys.stdout.flush()
+                        continue
+                else:
+                    sys.stdout.write(json.dumps({"id": rid, "error": "HTTP 401 (re-captura fallida o en cooldown)"}) + "\n")
+                    sys.stdout.flush()
+                    continue
+            else:
+                sys.stdout.write(json.dumps({"id": rid, "error": f"HTTP {e.code}"}) + "\n")
+                sys.stdout.flush()
+                continue
         except Exception as e:
             sys.stdout.write(json.dumps({"id": rid, "error": str(e)[:200]}) + "\n")
             sys.stdout.flush()

@@ -237,6 +237,15 @@ Cursor's own client makes, and streams back the edit sequence plus the next
 cursor-jump target. Your token never leaves the machine, and the Lua side never
 touches the network — that boundary is deliberate.
 
+> **Backend Antigravity (este fork):** `sidecar_antigravity.py` usa el backend de
+> completions de Antigravity/Google (`/v1internal:streamGenerateContent` con
+> `tab_flash_lite_preview` + OAuth propio), **no** StreamCpp. El modelo es de
+> completado inline, no de edición multidiff, así que **no es paridad 1:1 con
+> Cursor**: el ghost se extrae localmente (match de prefix más cercano al cursor
+> + anchor de coherencia gold↔buffer) y el "siguiente edit" se ubica con difflib
+> en su posición real para el salto `Tab`→jump. Ediciones de alto alcance o
+> refactors cross-buffer no se esperan de este modelo.
+
 See [`NOTICE`](./NOTICE) for rendering-technique attribution.
 
 ---

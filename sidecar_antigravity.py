@@ -22,6 +22,7 @@ PROTOCOLO NEUTRO (igual que sidecar.py): stdio JSON-lines.
   out: {"id","text","range","edits","prediction"}   (edits 0..N)
        {"id","error"}  /  {"config": {...}} al boot
 """
+import difflib
 import json
 import os
 import re
@@ -39,7 +40,7 @@ PROJECT = "aicode-consumers"
 MODEL_TAB = "tab_flash_lite_preview"
 SESSION_ID = os.environ.get("ANTY_SESSION", "-3750763034362895579")
 WINDOW = int(os.environ.get("ANTY_WINDOW", "25"))
-GHOST_MAX_LINES = int(os.environ.get("ANTY_GHOST_MAX", "6"))
+GHOST_MAX_LINES = int(os.environ.get("ANTY_GHOST_MAX", "3"))
 GHOST_MAX_CHARS = int(os.environ.get("ANTY_GHOST_MAX_CHARS", "400"))
 _HAS_TOKEN_OVERRIDE = bool(os.environ.get("ANTY_TOKEN"))
 
@@ -369,6 +370,51 @@ def strip_fences(text):
     return text.strip()
 
 
+def diff_edits(content, line, resp):
+    """Omnipresencia: difflib del gold contra el buffer para localizar el edit
+    en su posición REAL (no solo en el cursor). Devuelve [{text,range}] con
+    range 1-indexado inclusive, o [] si no hay un hunk coherente post-cursor
+    con anchor.
+
+    Confianza: exige que el gold esté replicando el MISMO archivo (coincidencia
+    global alta) — si el modelo inventó un archivo distinto (ej. cambió una
+    interface por otra), el diff no es confiable y se descarta."""
+    olines = content.split("\n")
+    rlines = resp.split("\n")
+    if not rlines:
+        return []
+    sm = difflib.SequenceMatcher(None, olines, rlines, autojunk=False)
+    equal_n = sum((j2 - j1) for op, i1, i2, j1, j2 in sm.get_opcodes() if op == "equal")
+    min_n = min(len(olines), len(rlines))
+    # si el gold replica <40% de las líneas, está inventando otro archivo
+    if min_n and (equal_n / min_n) < 0.40:
+        return []
+
+    edits = []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            continue
+        old = olines[i1:i2]
+        new = rlines[j1:j2]
+        if not new:
+            continue
+        # solo reemplazos/inserciones, no deletes puros
+        text = "\n".join(new).strip()
+        if not text or len(text) > GHOST_MAX_CHARS:
+            continue
+        if (j2 - j1) > GHOST_MAX_LINES + 2:
+            continue
+        edits.append({
+            "text": text,
+            "range": {"start": i1 + 1, "endInclusive": i2},  # 1-indexed inclusive
+            "old": old,
+        })
+    if not edits:
+        return []
+    edits.sort(key=lambda e: abs(e["range"]["start"] - (line + 1)))
+    return edits[:1]
+
+
 def extract_ghost(content, line, col, resp):
     if _ESCAPE.search(resp):
         return ""
@@ -377,17 +423,40 @@ def extract_ghost(content, line, col, resp):
     if not prefix:
         return ""
     rlines = resp.split("\n")
-    idx = None
-    for i, rl in enumerate(rlines):
-        if rl.startswith(prefix):
-            idx = i
-            break
-    if idx is None:
+
+    # Candidatos: TODAS las líneas del gold que empiecen con el prefix del
+    # cursor (el gold replica el archivo, así que puede haber varias). Elegir
+    # la más CERCANA a la posición del cursor, no la primera global — este era
+    # el bug que insertaba basura de otra parte del archivo.
+    cands = [i for i, rl in enumerate(rlines) if rl.startswith(prefix)]
+    if not cands:
         # continuación pura: el modelo no replicó el buffer, respondió solo el tail
         ghost = "\n".join(rlines).strip()
         if not ghost or len(ghost) > GHOST_MAX_CHARS:
             return ""
         return ghost
+
+    # trozo sin prefijo: un ghost que arranca pegando al cursor
+    GHOST_NEAR = int(os.environ.get("ANTY_GHOST_NEAR", "6"))
+
+    def anchor_ok(idx):
+        # K líneas antes del candidato deben coincidir con el buffer previo al
+        # cursor (coherencia: el gold está replicando ESTA zona, no otra).
+        k = 0
+        while k < 2 and line - 1 - k >= 0 and idx - 1 - k >= 0 and olines[line - 1 - k] == rlines[idx - 1 - k]:
+            k += 1
+        return k > 0
+
+    def score(idx):
+        dist = abs(idx - min(line, len(rlines) - 1))
+        return dist
+
+    anchored = [i for i in cands if anchor_ok(i)]
+    # máx-ALCANCE: priorizar candidato con anchor válido; si ninguno tiene,
+    # aceptar el más cercano al cursor (no romper si el gold difiere 1 línea).
+    pool = anchored if anchored else cands
+    idx = min(pool, key=score)
+
     tail = rlines[idx][len(prefix):]
     added = []
     on = min(line + 1, len(olines) - 1)
@@ -525,8 +594,27 @@ def serve():
                                          "edits": edits, "prediction": None}) + "\n")
             sys.stdout.flush()
             continue
-        # fallback ghost
+        # omnipresencia: si el gold replica fielmente el archivo, difflib ubica
+        # el "siguiente edit" en su posición real (no solo en el cursor) → el
+        # lado Lua puede saltar ahí (tab-tab-tab). Solo si el gold es coherente.
         stripped = strip_fences(text)
+        d_edits = diff_edits(content, row0, stripped)
+        if d_edits and not is_duplicate_block(
+                buffer_lines, d_edits[0]["range"]["start"], d_edits[0]["range"]["endInclusive"],
+                d_edits[0]["text"].split("\n")):
+            # descartar si el hunk es un delete-puro que no aporta texto útil
+            if d_edits[0]["text"] != d_edits[0].get("old", ""):
+                first = d_edits[0]
+                pred = None
+                # si el edit está FUERA de la línea del cursor, prediction → jump
+                if first["range"]["start"] != row0 + 1:
+                    pred = {"path": req.get("path") or "", "line": first["range"]["start"]}
+                sys.stdout.write(json.dumps({"id": rid, "text": first["text"],
+                                             "range": first["range"],
+                                             "edits": [first], "prediction": pred}) + "\n")
+                sys.stdout.flush()
+                continue
+        # fallback ghost
         ghost = extract_ghost(content, row0, col0, stripped)
         if ghost and is_duplicate_block(buffer_lines, row0 + 1, row0, ghost.split("\n")):
             ghost = ""

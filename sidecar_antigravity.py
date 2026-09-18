@@ -39,10 +39,14 @@ TOKFILE = os.path.expanduser("~/.config/nvim/antigravity_token")
 PROJECT = "aicode-consumers"
 MODEL_TAB = "tab_flash_lite_preview"
 SESSION_ID = os.environ.get("ANTY_SESSION", "-3750763034362895579")
-WINDOW = int(os.environ.get("ANTY_WINDOW", "25"))
+WINDOW = int(os.environ.get("ANTY_WINDOW", "16"))
+DOWN = int(os.environ.get("ANTY_DOWN", "16"))
+FILE_MAX_LINES = int(os.environ.get("ANTY_FILE_MAX", "200"))
+MAX_REPLACE_LINES = int(os.environ.get("ANTY_MAX_REPLACE", "28"))
+MAX_REPLACE_CURSOR_DIST = int(os.environ.get("ANTY_MAX_CURSOR_DIST", "5"))
 GHOST_MAX_LINES = int(os.environ.get("ANTY_GHOST_MAX", "3"))
 GHOST_MAX_CHARS = int(os.environ.get("ANTY_GHOST_MAX_CHARS", "400"))
-_HAS_TOKEN_OVERRIDE = bool(os.environ.get("ANTY_TOKEN"))
+GHOST_NEAR = int(os.environ.get("ANTY_GHOST_NEAR", "6"))
 
 _TOPLEVEL = re.compile(r"^(export|import|function|class|interface|type|const|let|var|enum|namespace|pub|fn|def)\b")
 _ESCAPE = re.compile(r'\\[nrtu0]|\\"|\\\\')
@@ -76,14 +80,29 @@ def refresh_bearer():
     return None
 
 
-def local_window(content, line, col):
+def local_window(content, line, col, lang=""):
     lines = content.split("\n")
-    lo = max(0, line - WINDOW)
-    win = lines[lo:line + 1]
+    if len(lines) <= FILE_MAX_LINES:
+        # Archivo corto → mandarlo COMPLETO con <|cursor|> insertado en la
+        # línea, sin borrar lo que sigue. El modelo ve el archivo real y
+        # completa sin inventar borrados.
+        lo, hi = 0, len(lines)
+    else:
+        lo = max(0, line - WINDOW)
+        hi = min(len(lines), line + 1 + DOWN)
+    win = lines[lo:hi]
     row = min(line - lo, len(win) - 1)
     cur = win[row]
-    win[row] = cur[:col] + "<|cursor|>"
-    return "\n".join(win)
+    # con `<|cursor|>` dentro, el resto de la línea original queda fuera:
+    # si el cursor va seguido de texto visible, se preserva como contexto
+    if col < len(cur):
+        win[row] = cur[:col] + "<|cursor|>" + cur[col:]
+    else:
+        win[row] = cur[:col] + "<|cursor|>"
+    head = ""
+    if lang:
+        head = f"This is a {lang} file.\n\n"
+    return head + "\n".join(win)
 
 
 def tools_decl():
@@ -160,13 +179,30 @@ def tools_decl():
     ]
 
 
-def tab_req(content, line, col):
+def lang_for_path(path):
+    if not path:
+        return ""
+    ext = os.path.splitext(path)[1].lower()
+    return {
+        ".ts": "TypeScript", ".tsx": "TypeScript/React",
+        ".js": "JavaScript", ".jsx": "JavaScript/React",
+        ".py": "Python", ".rs": "Rust", ".go": "Go",
+        ".java": "Java", ".c": "C", ".h": "C", ".cpp": "C++",
+        ".hpp": "C++", ".cs": "C#", ".rb": "Ruby", ".php": "PHP",
+        ".swift": "Swift", ".kt": "Kotlin", ".lua": "Lua",
+        ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell",
+        ".css": "CSS", ".scss": "SCSS", ".html": "HTML",
+        ".json": "JSON", ".md": "Markdown",
+    }.get(ext, "")
+
+
+def tab_req(content, line, col, path=""):
     payload = {
         "project": PROJECT,
         "requestId": "neocursor/tab/" + os.urandom(8).hex(),
         "request": {
             "contents": [{"role": "user", "parts": [{
-                "text": local_window(content, line, col)
+                "text": local_window(content, line, col, lang_for_path(path))
             }]}],
             "systemInstruction": {
                 "role": "user",
@@ -179,7 +215,7 @@ def tab_req(content, line, col):
                 }],
             },
             "sessionId": SESSION_ID,
-            "generationConfig": {"maxOutputTokens": 500,
+            "generationConfig": {"maxOutputTokens": 256,
                                  "thinkingConfig": {"includeThoughts": False}},
         },
         "model": MODEL_TAB,
@@ -256,6 +292,24 @@ def one_edit(buffer_lines, s1, e1, tgt, rep):
     return {"text": rep, "range": {"start": s1, "endInclusive": e1}}
 
 
+def scope_ok(n_lines, s1, e1, cursor_line, full_context):
+    """Valida el rango de un tool-call de reemplazo.
+
+    El cap de líneas (MAX_REPLACE_LINES) SIEMPRE aplica. La proximidad al
+    cursor (MAX_REPLACE_CURSOR_DIST) solo es filtro DURO cuando el modelo NO
+    vio el archivo completo (archivo grande → ventana 16+16): en ese caso un
+    edit lejano sería un ancla a ciegas (suerte). Con el archivo completo
+    visible, la proximidad NO bloquea — solo ordena las sugerencias (el
+    'siguiente edit' puede estar en cualquier parte del archivo)."""
+    if not (1 <= s1 <= e1 <= n_lines):
+        return False
+    if (e1 - s1 + 1) > MAX_REPLACE_LINES:
+        return False
+    if not full_context and abs(s1 - (cursor_line + 1)) > MAX_REPLACE_CURSOR_DIST:
+        return False
+    return True
+
+
 def is_duplicate_block(buffer_lines, s1, e1, lines):
     """True si `lines` (≥1) ya aparece completo y contiguo en el buffer FUERA
     del rango [s1,e1]. Ataca el caso 'el modelo re-propone el bloque que el
@@ -274,20 +328,25 @@ def is_duplicate_block(buffer_lines, s1, e1, lines):
     return False
 
 
-def function_call_edits(buffer_lines, name, args):
+def function_call_edits(buffer_lines, name, args, cursor_line, full_context):
     edits = []
+    n_lines = len(buffer_lines)
     try:
         if name == "replace_file_content":
-            e = one_edit(buffer_lines, int(args["StartLine"]), int(args["EndLine"]),
-                         args["TargetContent"], args["ReplacementContent"])
-            if e:
-                edits.append(e)
-        elif name == "multi_replace_file_content":
-            for ch in args.get("ReplacementChunks") or []:
-                e = one_edit(buffer_lines, int(ch["StartLine"]), int(ch["EndLine"]),
-                             ch["TargetContent"], ch["ReplacementContent"])
+            s1, e1 = int(args["StartLine"]), int(args["EndLine"])
+            if scope_ok(n_lines, s1, e1, cursor_line, full_context):
+                e = one_edit(buffer_lines, s1, e1,
+                             args["TargetContent"], args["ReplacementContent"])
                 if e:
                     edits.append(e)
+        elif name == "multi_replace_file_content":
+            for ch in args.get("ReplacementChunks") or []:
+                s1, e1 = int(ch["StartLine"]), int(ch["EndLine"])
+                if scope_ok(n_lines, s1, e1, cursor_line, full_context):
+                    e = one_edit(buffer_lines, s1, e1,
+                                 ch["TargetContent"], ch["ReplacementContent"])
+                    if e:
+                        edits.append(e)
     except (KeyError, TypeError, ValueError):
         pass
     return edits
@@ -300,7 +359,7 @@ _XML_RE = re.compile(
 _TAG_FIELD = re.compile(r"<\s*([A-Za-z0-9_]+)\s*>([\s\S]*?)</\s*\1\s*>")
 
 
-def xml_tool_edits(buffer_lines, text):
+def xml_tool_edits(buffer_lines, text, cursor_line, full_context):
     """Best-effort: parsea bloques XML de tool-call a edits."""
     edits = []
     if _ESCAPE.search(text):
@@ -330,16 +389,19 @@ def xml_tool_edits(buffer_lines, text):
                 e1 = to_int(ch.get("EndLine"))
                 tgt = clean(ch.get("TargetContent") or "")
                 rep = clean(ch.get("ReplacementContent") or "")
-                e = one_edit(buffer_lines, s1, e1, tgt, rep)
+                if scope_ok(len(buffer_lines), s1, e1, cursor_line, full_context):
+                    e = one_edit(buffer_lines, s1, e1, tgt, rep)
+                    if e:
+                        edits.append(e)
+        else:
+            s1 = to_int(fields.get("StartLine"))
+            e1 = to_int(fields.get("EndLine"))
+            if scope_ok(len(buffer_lines), s1, e1, cursor_line, full_context):
+                e = one_edit(buffer_lines, s1, e1,
+                             clean(fields.get("TargetContent") or ""),
+                             clean(fields.get("ReplacementContent") or ""))
                 if e:
                     edits.append(e)
-        else:
-            e = one_edit(buffer_lines, to_int(fields.get("StartLine")),
-                         to_int(fields.get("EndLine")),
-                         clean(fields.get("TargetContent") or ""),
-                         clean(fields.get("ReplacementContent") or ""))
-            if e:
-                edits.append(e)
     return edits
 
 
@@ -454,7 +516,6 @@ def extract_ghost(content, line, col, resp):
         return ghost
 
     # trozo sin prefijo: un ghost que arranca pegando al cursor
-    GHOST_NEAR = int(os.environ.get("ANTY_GHOST_NEAR", "6"))
 
     def anchor_ok(idx):
         # ≥2 líneas antes del candidato deben coincidir con el buffer previo al
@@ -561,8 +622,9 @@ def serve():
         content = req.get("content") or ""
         row0 = req.get("line") or 0
         col0 = req.get("col") or 0
+        path = req.get("path") or ""
         try:
-            payload = tab_req(content, row0, col0)
+            payload = tab_req(content, row0, col0, path)
             calls, text = call_tab(payload, bearer)
         except urllib.error.HTTPError as e:
             if e.code == 401:
@@ -570,7 +632,7 @@ def serve():
                 new_tok = auto_refresh_token()
                 if new_tok:
                     try:
-                        payload = tab_req(content, row0, col0)
+                        payload = tab_req(content, row0, col0, path)
                         calls, text = call_tab(payload, new_tok)
                         bearer = new_tok
                     except urllib.error.HTTPError as e2:
@@ -595,14 +657,18 @@ def serve():
             continue
 
         buffer_lines = content.split("\n")
+        full_context = len(buffer_lines) <= FILE_MAX_LINES
         edits = []
         for fc in calls:
-            edits.extend(function_call_edits(buffer_lines, fc.get("name"), fc.get("args") or {}))
+            edits.extend(function_call_edits(buffer_lines, fc.get("name"), fc.get("args") or {}, row0, full_context))
         if not edits:
-            edits = xml_tool_edits(buffer_lines, text)
+            edits = xml_tool_edits(buffer_lines, text, row0, full_context)
         if edits:
-            # cap defensivo: ≤6 edits, cada reemplazo ≤40 líneas
-            edits = [e for e in edits if (e["range"]["endInclusive"] - e["range"]["start"] + 1) <= 40][:6]
+            # los edits de tool-call llegan en orden arbitrario del modelo:
+            # ordenar por cercanía al cursor (factor relevante, no definitivo)
+            edits.sort(key=lambda e: abs(e["range"]["start"] - (row0 + 1)))
+            # cap defensivo: ≤6 edits, cada reemplazo ≤ MAX_REPLACE_LINES
+            edits = [e for e in edits if (e["range"]["endInclusive"] - e["range"]["start"] + 1) <= MAX_REPLACE_LINES][:6]
             # filtro anti-duplicado: descartar edits que repiten un bloque existente
             edits = [
                 e for e in edits

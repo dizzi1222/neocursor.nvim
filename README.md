@@ -246,6 +246,23 @@ touches the network — that boundary is deliberate.
 > en su posición real para el salto `Tab`→jump. Ediciones de alto alcance o
 > refactors cross-buffer no se esperan de este modelo.
 
+**Parámetros del sidecar Antigravity** (env, defaults):
+
+| Variable | Default | Uso |
+|---|---|---|
+| `ANTY_WINDOW` | `16` | Líneas de contexto *arriba* del cursor |
+| `ANTY_DOWN` | `16` | Líneas de contexto *abajo* del cursor |
+| `ANTY_FILE_MAX` | `200` | Si el archivo tiene ≤ este N° de líneas, se manda **completo** (con `<\|cursor\|>`) en vez de ventana |
+| `ANTY_MAX_REPLACE` | `28` | Cap de líneas por edit de tool-call (`replace_file_content` / XML) — rellenos de función enteros OK; el ancla real es `TargetContent` exacto |
+| `ANTY_MAX_CURSOR_DIST` | `5` | Máx. distancia de `StartLine` al cursor. **Condicional:** si el archivo es corto (≤ `ANTY_FILE_MAX`, el modelo ve el archivo completo), la proximidad **solo ordena** las sugerencias, nunca bloquea — el "siguiente edit" puede estar en cualquier parte. Si el archivo es grande (el modelo solo ve la ventana 16+16), la proximidad vuelve a ser filtro duro (un ancla lejana a ciegas sería suerte). |
+| `ANTY_GHOST_MAX` | `3` | Máx. líneas del ghost |
+| `ANTY_GHOST_MAX_CHARS` | `400` | Máx. chars del ghost |
+| `ANTY_GHOST_NEAR` | `6` | Ventana de cercanía del ghost |
+| `ANTY_SESSION` | fijo | sessionId usado en el payload |
+
+El lenguaje del archivo se anuncia al modelo vía `lang_for_path()` (extensión →
+`TypeScript`, `Python`, `Rust`, …) para orientar mejor que un rol genérico.
+
 See [`NOTICE`](./NOTICE) for rendering-technique attribution.
 
 ---

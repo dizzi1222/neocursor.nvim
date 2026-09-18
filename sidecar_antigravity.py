@@ -42,6 +42,10 @@ SESSION_ID = os.environ.get("ANTY_SESSION", "-3750763034362895579")
 WINDOW = int(os.environ.get("ANTY_WINDOW", "16"))
 DOWN = int(os.environ.get("ANTY_DOWN", "16"))
 FILE_MAX_LINES = int(os.environ.get("ANTY_FILE_MAX", "200"))
+MID_LINES = int(os.environ.get("ANTY_MID_LINES", "1000"))
+WINDOW_MID = int(os.environ.get("ANTY_WINDOW_MID", "32"))
+DOWN_MID = int(os.environ.get("ANTY_DOWN_MID", "32"))
+SKELETON_COUNT = int(os.environ.get("ANTY_SKELETON_COUNT", "60"))
 MAX_REPLACE_LINES = int(os.environ.get("ANTY_MAX_REPLACE", "28"))
 MAX_REPLACE_CURSOR_DIST = int(os.environ.get("ANTY_MAX_CURSOR_DIST", "5"))
 GHOST_MAX_LINES = int(os.environ.get("ANTY_GHOST_MAX", "3"))
@@ -80,16 +84,39 @@ def refresh_bearer():
     return None
 
 
+def skeleton(lines):
+    """Mapa top-level del archivo (≥200 líneas): solo firmas y su línea, para
+    que el modelo tenga visión file-wide sin el costo de mandar el archivo
+    completo por keystroke. Imita el contexto 'file-wide' de Supercomplete."""
+    out = []
+    for i, ln in enumerate(lines, 1):
+        s = ln.lstrip()
+        if not s or s.startswith(("#", "//", "/*", "*", '"', "'")):
+            continue
+        if _TOPLEVEL.match(s):
+            out.append(f"L{i}  {s[:80]}")
+            if len(out) >= SKELETON_COUNT:
+                break
+    if not out:
+        return ""
+    return "$FILE_STRUCTURE\n" + "\n".join(out) + "\n$END_FILE_STRUCTURE\n"
+
+
 def local_window(content, line, col, lang=""):
     lines = content.split("\n")
-    if len(lines) <= FILE_MAX_LINES:
-        # Archivo corto → mandarlo COMPLETO con <|cursor|> insertado en la
-        # línea, sin borrar lo que sigue. El modelo ve el archivo real y
-        # completa sin inventar borrados.
-        lo, hi = 0, len(lines)
+    n = len(lines)
+    # Tramo 1 — archivo corto: completo con <|cursor|> (el modelo ve el archivo).
+    # Tramo 2 — medio: ventana amplia. Tramo 3 — grande: ventana compacta.
+    # En todos los tramos el modelo puede tocar cualquier parte (file-wide); el
+    # esqueleto top-level compensa la ventana recortada dándole mapa del archivo.
+    if n <= FILE_MAX_LINES:
+        lo, hi = 0, n
+    elif n <= MID_LINES:
+        lo = max(0, line - WINDOW_MID)
+        hi = min(n, line + 1 + DOWN_MID)
     else:
         lo = max(0, line - WINDOW)
-        hi = min(len(lines), line + 1 + DOWN)
+        hi = min(n, line + 1 + DOWN)
     win = lines[lo:hi]
     row = min(line - lo, len(win) - 1)
     cur = win[row]
@@ -102,7 +129,8 @@ def local_window(content, line, col, lang=""):
     head = ""
     if lang:
         head = f"This is a {lang} file.\n\n"
-    return head + "\n".join(win)
+    extra = skeleton(lines) if n > FILE_MAX_LINES else ""
+    return head + extra + "\n".join(win)
 
 
 def tools_decl():
@@ -295,17 +323,15 @@ def one_edit(buffer_lines, s1, e1, tgt, rep):
 def scope_ok(n_lines, s1, e1, cursor_line, full_context):
     """Valida el rango de un tool-call de reemplazo.
 
-    El cap de líneas (MAX_REPLACE_LINES) SIEMPRE aplica. La proximidad al
-    cursor (MAX_REPLACE_CURSOR_DIST) solo es filtro DURO cuando el modelo NO
-    vio el archivo completo (archivo grande → ventana 16+16): en ese caso un
-    edit lejano sería un ancla a ciegas (suerte). Con el archivo completo
-    visible, la proximidad NO bloquea — solo ordena las sugerencias (el
-    'siguiente edit' puede estar en cualquier parte del archivo)."""
+    Supercomplete es file-wide por diseño: las sugerencias pueden tocar
+    CUALQUIER parte del documento (renombrar variables, actualizar definiciones
+    separadas). Por eso la proximidad al cursor NUNCA bloquea — solo ordena
+    (ver serve()). La protección anti-destructivo real son el cap de líneas
+    (MAX_REPLACE_LINES) y el ancla exacta (TargetContent == buffer en one_edit):
+    si el modelo no replica la zona, el edit cae solo."""
     if not (1 <= s1 <= e1 <= n_lines):
         return False
     if (e1 - s1 + 1) > MAX_REPLACE_LINES:
-        return False
-    if not full_context and abs(s1 - (cursor_line + 1)) > MAX_REPLACE_CURSOR_DIST:
         return False
     return True
 
@@ -475,6 +501,10 @@ def diff_edits(content, line, resp):
         if not text or len(text) > GHOST_MAX_CHARS:
             continue
         if (j2 - j1) > GHOST_MAX_LINES + 2:
+            continue
+        # el rango emitido usa el lado VIEJO del buffer; si el gold "omitió"
+        # una zona entera, i2-i1 explota (ej. [L27-226]) → cap al rango emitido
+        if (i2 - i1 + 1) > MAX_REPLACE_LINES:
             continue
         edits.append({
             "text": text,
@@ -687,6 +717,12 @@ def serve():
         # lado Lua puede saltar ahí (tab-tab-tab). Solo si el gold es coherente.
         stripped = strip_fences(text)
         d_edits = diff_edits(content, row0, stripped)
+        # red de seguridad: cualquier path de diff con rango que exceda el cap
+        # (28 líneas) se descarta — mata los borrados masivos [L27-226] etc.
+        d_edits = [
+            e for e in d_edits
+            if (e["range"]["endInclusive"] - e["range"]["start"] + 1) <= MAX_REPLACE_LINES
+        ]
         if d_edits and not is_duplicate_block(
                 buffer_lines, d_edits[0]["range"]["start"], d_edits[0]["range"]["endInclusive"],
                 d_edits[0]["text"].split("\n")):

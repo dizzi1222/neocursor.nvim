@@ -250,15 +250,32 @@ touches the network — that boundary is deliberate.
 
 | Variable | Default | Uso |
 |---|---|---|
-| `ANTY_WINDOW` | `16` | Líneas de contexto *arriba* del cursor |
-| `ANTY_DOWN` | `16` | Líneas de contexto *abajo* del cursor |
-| `ANTY_FILE_MAX` | `200` | Si el archivo tiene ≤ este N° de líneas, se manda **completo** (con `<\|cursor\|>`) en vez de ventana |
-| `ANTY_MAX_REPLACE` | `28` | Cap de líneas por edit de tool-call (`replace_file_content` / XML) — rellenos de función enteros OK; el ancla real es `TargetContent` exacto |
-| `ANTY_MAX_CURSOR_DIST` | `5` | Máx. distancia de `StartLine` al cursor. **Condicional:** si el archivo es corto (≤ `ANTY_FILE_MAX`, el modelo ve el archivo completo), la proximidad **solo ordena** las sugerencias, nunca bloquea — el "siguiente edit" puede estar en cualquier parte. Si el archivo es grande (el modelo solo ve la ventana 16+16), la proximidad vuelve a ser filtro duro (un ancla lejana a ciegas sería suerte). |
+| `ANTY_WINDOW` | `16` | Líneas *arriba* del cursor en archivos grandes |
+| `ANTY_DOWN` | `16` | Líneas *abajo* del cursor en archivos grandes |
+| `ANTY_FILE_MAX` | `200` | Archivo ≤ este N° de líneas → se manda **completo** (con `<\|cursor\|>`) |
+| `ANTY_MID_LINES` | `1000` | Umbral medio: archivos 201–1000 → ventana `ANTY_WINDOW_MID`+`ANTY_DOWN_MID` |
+| `ANTY_WINDOW_MID` | `32` | Líneas *arriba* del cursor en tramo medio (201–1000) |
+| `ANTY_DOWN_MID` | `32` | Líneas *abajo* del cursor en tramo medio (201–1000) |
+| `ANTY_SKELETON_COUNT` | `60` | Máx. firmas top-level del esqueleto (archivos > `ANTY_FILE_MAX`) |
+| `ANTY_MAX_REPLACE` | `28` | Cap de líneas por edit (`replace_file_content`/XML/`diff_edits`) — el ancla real es `TargetContent` exacto + cap de rango |
+| `ANTY_MAX_CURSOR_DIST` | `5` | La proximidad al cursor **solo ordena** (Supercomplete es file-wide por diseño: puede tocar cualquier parte del doc). Ya nunca bloquea — las sugerencias lejanas con `TargetContent` exacto pasan |
 | `ANTY_GHOST_MAX` | `3` | Máx. líneas del ghost |
 | `ANTY_GHOST_MAX_CHARS` | `400` | Máx. chars del ghost |
 | `ANTY_GHOST_NEAR` | `6` | Ventana de cercanía del ghost |
 | `ANTY_SESSION` | fijo | sessionId usado en el payload |
+
+**Escalado de contexto (file-wide):**
+
+| Arquivo | Contexto enviado | Proximidad |
+|---|---|---|
+| ≤ 200 | Archivo **completo** + `<\|cursor\|>` | Solo ordena |
+| 201–1000 | Ventana **32+32** + esqueleto top-level | Solo ordena |
+| > 1000 | Ventana **16+16** + esqueleto top-level | Solo ordena |
+
+> El esqueleto top-level (`$FILE_STRUCTURE`/`$END_FILE_STRUCTURE`) lista las
+> firmas (`export`, `function`, `class`, …) con su línea `L42 programs = {`.
+> Le da al modelo visión file-wide sin el costo de mandar el archivo completo
+> por keystroke — el mecanismo que reemplaza la proximidad como factor.
 
 El lenguaje del archivo se anuncia al modelo vía `lang_for_path()` (extensión →
 `TypeScript`, `Python`, `Rust`, …) para orientar mejor que un rol genérico.

@@ -78,9 +78,8 @@ def refresh_bearer():
 def local_window(content, line, col):
     lines = content.split("\n")
     lo = max(0, line - WINDOW)
-    hi = min(len(lines), line + WINDOW + 1)
-    win = lines[lo:hi]
-    row = line - lo
+    win = lines[lo:line + 1]
+    row = min(line - lo, len(win) - 1)
     cur = win[row]
     win[row] = cur[:col] + "<|cursor|>"
     return "\n".join(win)
@@ -166,30 +165,21 @@ def tab_req(content, line, col):
         "requestId": "neocursor/tab/" + os.urandom(8).hex(),
         "request": {
             "contents": [{"role": "user", "parts": [{
-                "text": (
-                    "The cursor is at <|cursor|>. Make the NEXT LOGICAL EDIT at the "
-                    "cursor: output a replace_file_content (one block) or "
-                    "multi_replace_file_content (several blocks) tool call whose "
-                    "TargetContent EXACTLY matches the file text. Never return plain "
-                    "text file rewrites.\n\n" + local_window(content, line, col)
-                )
+                "text": local_window(content, line, col)
             }]}],
             "systemInstruction": {
                 "role": "user",
                 "parts": [{
                     "text": (
-                        "You are a completion engine inside an editor. Your ONLY "
-                        "allowed output is a replace_file_content or "
-                        "multi_replace_file_content tool call for the next logical edit "
-                        "at <|cursor|>. TargetContent must match the file verbatim."
+                        "You are an expert software engineer working inside an "
+                        "editor. Given the file context below, write the complete "
+                        "file content including your edit after <|cursor|>."
                     )
                 }],
             },
-            "tools": tools_decl(),
-            "toolConfig": {"functionCallingConfig": {"mode": "VALIDATED"}},
             "sessionId": SESSION_ID,
-            "generationConfig": {"maxOutputTokens": 900},
-            "labels": {"model_enum": "MODEL_PLACEHOLDER_M71"},
+            "generationConfig": {"maxOutputTokens": 500,
+                                 "thinkingConfig": {"includeThoughts": False}},
         },
         "model": MODEL_TAB,
         "userAgent": "antigravity",
@@ -315,6 +305,17 @@ def strip_fences(text):
         if lines and lines[-1].startswith("```"):
             lines = lines[:-1]
         text = "\n".join(lines)
+    # recortar colas de tool-call a medio emitir (residuos XML/JSON)
+    for marker in ("</replace_file_content>", "</multi_replace_file_content>", "<replace_file_content>", "<multi_replace_file_content>"):
+        if marker in text:
+            text = text.split(marker)[0]
+    # cortar loops de comillas escapadas tipo "\n"\n"\n...
+    m = re.search(r'(?:"\n"){2,}', text)
+    if m:
+        text = text[: m.start()]
+    text = re.sub(r"[\"']\s*\n\t*[}\]]\s*$", "", text)
+    # cola JSON huérfana: comilla solitaria al final (artefacto del escape)
+    text = re.sub(r'["\']\s*$', "", text)
     return text.strip()
 
 
@@ -332,7 +333,11 @@ def extract_ghost(content, line, col, resp):
             idx = i
             break
     if idx is None:
-        return ""
+        # continuación pura: el modelo no replicó el buffer, respondió solo el tail
+        ghost = "\n".join(rlines).strip()
+        if not ghost or len(ghost) > GHOST_MAX_CHARS:
+            return ""
+        return ghost
     tail = rlines[idx][len(prefix):]
     added = []
     on = min(line + 1, len(olines) - 1)

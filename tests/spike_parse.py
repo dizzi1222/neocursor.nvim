@@ -177,10 +177,16 @@ def parse_edits(buffer_lines, call_name, args):
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else None
     demo = open(path).read().split("\n") if path else (
-        "export interface User {\n  id: number\n"
+        "export function stats(users) {\n"
+        "  let total = 0\n"
+        "  for (const u of users) {\n"
+        "    total\n"  # ← línea incompleta: el modelo debe editarla
+        "  }\n"
+        "  return total\n"
+        "}\n"
     ).split("\n")
-    row0 = int(sys.argv[2]) if len(sys.argv) > 2 else 1
-    col0 = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+    row0 = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+    col0 = int(sys.argv[3]) if len(sys.argv) > 3 else 4
     cur = demo[row0] if row0 < len(demo) else ""
     marked = [l for l in demo]
     marked[row0] = cur[:col0] + "<|cursor|>" + cur[col0:]
@@ -222,7 +228,10 @@ def main():
                 ],
             },
             "tools": tools_decl(),
-            "generationConfig": {"maxOutputTokens": 600},
+            "toolConfig": {"functionCallingConfig": {"mode": "VALIDATED"}},
+            "sessionId": "-3750763034362895579",
+            "generationConfig": {"maxOutputTokens": 900},
+            "labels": {"model_enum": "MODEL_PLACEHOLDER_M71"},
         },
         "model": "tab_flash_lite_preview",
         "userAgent": "antigravity",
@@ -272,7 +281,8 @@ def main():
         for e in edits:
             print("  L%d-%d text=%r" % (e["range"]["start"], e["range"]["endInclusive"], e["text"][:120]))
     if not calls and texts:
-        print("solo texto:", "".join(texts)[:200])
+        print("solo texto (completo):")
+        print("".join(texts))
     return 0
 
 

@@ -215,7 +215,35 @@ def call_tab(payload, bearer):
                     calls.append(p["functionCall"])
                 elif p.get("text"):
                     texts.append(p["text"])
-    return calls, "".join(texts).strip()
+    return calls, _unescape_text("".join(texts)).strip()
+
+
+def _unescape_text(text):
+    """El modelo a veces mezcla el gold con escapes JSON literales (\\n, \\\"
+    como 2 chars) entre newlines reales. Decodificar solo esas secuencias de
+    forma determinista — json.loads es frágil (revienta con comillas reales)."""
+    if "\\n" not in text and '\\"' not in text and "\\t" not in text and "\\\\" not in text:
+        return text
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "n":
+                out.append("\n"); i += 2; continue
+            if nxt == "t":
+                out.append("\t"); i += 2; continue
+            if nxt == "r":
+                out.append("\r"); i += 2; continue
+            if nxt == "\\":
+                out.append("\\"); i += 2; continue
+            if nxt == '"':
+                out.append('"'); i += 2; continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 # ----------------------------------------------------------------------------

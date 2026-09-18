@@ -587,7 +587,9 @@ local function render_result(res)
       bufnr = bufnr,
       start0 = math.max(0, start1 - 1),
       end0_excl = end1,
-      lines = vim.split(e.text or "", "\n", { plain = true }),
+      -- delete puro: text vacío sobre un rango → borrar líneas (set_lines + {}), no {""}
+      lines = (e.text == nil or e.text == "") and (end1 > start1)
+        and {} or vim.split(e.text or "", "\n", { plain = true }),
     }
   end
 

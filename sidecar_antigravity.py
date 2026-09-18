@@ -396,6 +396,16 @@ def diff_edits(content, line, resp):
             continue
         old = olines[i1:i2]
         new = rlines[j1:j2]
+        if op == "delete":
+            # borrado puro: el modelo quitó líneas → reemplazar el rango por nada
+            if (i2 - i1) > GHOST_MAX_LINES + 5:  # hasta un bloque (~8 ln)
+                continue
+            edits.append({
+                "text": "",
+                "range": {"start": i1 + 1, "endInclusive": i2},
+                "old": old,
+            })
+            continue
         if not new:
             continue
         # solo reemplazos/inserciones, no deletes puros
@@ -602,8 +612,8 @@ def serve():
         if d_edits and not is_duplicate_block(
                 buffer_lines, d_edits[0]["range"]["start"], d_edits[0]["range"]["endInclusive"],
                 d_edits[0]["text"].split("\n")):
-            # descartar si el hunk es un delete-puro que no aporta texto útil
-            if d_edits[0]["text"] != d_edits[0].get("old", ""):
+            # descartar no-op: el texto nuevo igual al viejo (diff en vano)
+            if "\n".join(d_edits[0].get("old") or []) != d_edits[0]["text"]:
                 first = d_edits[0]
                 pred = None
                 # si el edit está FUERA de la línea del cursor, prediction → jump

@@ -21,7 +21,11 @@
 
 <p align="center">
 <a href="https://github.com/dizzi1222/nvim">
-  <img src="https://github.com/user-attachments/assets/43998c73-c698-40a8-857a-8b6bae37ed27" alt="Best Nvim Config" width="890">
+  <img src="https://github.com/user-attachments/assets/5e66ad33-fdd8-4b46-af7e-c64abeb43b0a" alt="Best Nvim Config" width="1000" height="781">
+  <img src="https://github.com/user-attachments/assets/0b3dbc84-e2e0-4b2a-8f04-eccd7063d2ed" alt="Best Nvim Config" width="876" height="470">
+  <img src="https://github.com/user-attachments/assets/ce3d9c62-9a23-4fc8-8a81-2d4effc0bd88" alt="Best Nvim Config" width="481" height="600">
+  <img src="https://github.com/user-attachments/assets/39cf41fc-f425-40cb-bc27-a26a8ca7d662" alt="Best Nvim Config" width="971" height="831">
+  <img src="https://github.com/user-attachments/assets/9e70358d-ffee-48a4-8cd2-dc3cfc9719d5" alt="Best Nvim Config" width="625" height="646">
 </a>
 </p>
 

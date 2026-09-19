@@ -258,7 +258,7 @@ def tab_req(content, line, col, path=""):
     return payload
 
 
-def call_tab(payload, bearer):
+def call_tab(payload, bearer, content=""):
     h = {
         "Authorization": "Bearer " + bearer,
         "Content-Type": "application/json",
@@ -270,28 +270,60 @@ def call_tab(payload, bearer):
         BASE + "/v1internal:streamGenerateContent?alt=sse",
         data=body, headers=h, method="POST",
     )
-    raw = urllib.request.urlopen(req, timeout=90).read().decode("utf-8", "replace")
+    resp = urllib.request.urlopen(req, timeout=90)
+    # buffer original (sin cabecera/ventana/esqueleto) para saber cuándo el gold
+    # ya replicó TODO el archivo y podemos cortar el stream temprano (igual que
+    # Cursor): no esperar a que el server genere el archivo completo.
+    stop_lines = None
+    if content:
+        cl = [l for l in content.split("\n") if l.strip()]
+        # últimas 3 líneas no vacías del buffer = marca de "replicó hasta el final"
+        stop_lines = cl[-3:] if len(cl) >= 3 else (cl or None)
+    chunks = []
+    try:
+        while True:
+            ln = resp.readline()
+            if not ln:
+                break
+            try:
+                line = ln.decode("utf-8", "replace")
+            except Exception:
+                break
+            if not line.startswith("data:"):
+                continue
+            try:
+                j = json.loads(line[5:].strip())
+            except Exception:
+                continue
+            parts = j.get("response", {}).get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            got_call = any(p.get("functionCall") for p in parts)
+            for p in parts:
+                if p.get("functionCall"):
+                    continue
+                if p.get("text"):
+                    chunks.append(p["text"])
+            # corte temprano: si ya hubo functionCall o el gold (acumulado,
+            # unescaped) contiene las últimas líneas del buffer → suficiente.
+            if got_call:
+                break
+            if stop_lines:
+                acc = _unescape_text("".join(chunks))
+                if all(sl in acc for sl in stop_lines):
+                    break
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    raw = "".join("data: {\"response\": {\"candidates\": [{\"content\": {\"parts\": [{\"text\": %s}]}}]}}\n" % json.dumps(c) for c in chunks)
     if ANTY_DUMP:
         try:
             with open(ANTY_DUMP, "a") as fh:  # sin bearer; JSON-lines
                 fh.write(json.dumps({"request": payload, "response": raw}) + "\n")
         except Exception:
             pass
-    calls, texts = [], []
-    for ln in raw.split("\n"):
-        ln = ln.strip()
-        if not ln.startswith("data:"):
-            continue
-        try:
-            j = json.loads(ln[5:].strip())
-        except Exception:
-            continue
-        for c in j.get("response", {}).get("candidates", []):
-            for p in c.get("content", {}).get("parts", []):
-                if p.get("functionCall"):
-                    calls.append(p["functionCall"])
-                elif p.get("text"):
-                    texts.append(p["text"])
+    calls = []
+    texts = chunks
     return calls, _unescape_text("".join(texts)).strip()
 
 
@@ -677,7 +709,7 @@ def serve():
         path = req.get("path") or ""
         try:
             payload = tab_req(content, row0, col0, path)
-            calls, text = call_tab(payload, bearer)
+            calls, text = call_tab(payload, bearer, content)
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 # token vencido/invalidado → re-captura automática + 1 reintento
@@ -685,7 +717,7 @@ def serve():
                 if new_tok:
                     try:
                         payload = tab_req(content, row0, col0, path)
-                        calls, text = call_tab(payload, new_tok)
+                        calls, text = call_tab(payload, new_tok, content)
                         bearer = new_tok
                     except urllib.error.HTTPError as e2:
                         sys.stdout.write(json.dumps({"id": rid, "error": f"HTTP {e2.code} (post-refresh)"}) + "\n")
